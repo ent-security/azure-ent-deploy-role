@@ -2,6 +2,32 @@ data "azurerm_subscription" "current" {}
 data "azuread_client_config" "current" {}
 
 # -----------------------------------------------------------------------------
+# Resource Provider Registration
+#
+# Ensures all Azure resource providers required by the Ent platform are
+# registered on this subscription. Registration is idempotent — already-registered
+# providers are a no-op. The customer/admin running this module has sufficient
+# permissions; the deploy SP intentionally does not.
+# -----------------------------------------------------------------------------
+
+resource "azurerm_resource_provider_registration" "required" {
+  for_each = toset([
+    "Microsoft.ContainerService",
+    "Microsoft.DBforPostgreSQL",
+    "Microsoft.Cache",
+    "Microsoft.ContainerRegistry",
+    "Microsoft.ServiceBus",
+    "Microsoft.Storage",
+    "Microsoft.KeyVault",
+    "Microsoft.Network",
+    "Microsoft.ManagedIdentity",
+    "Microsoft.Compute",
+    "Microsoft.Resources",
+  ])
+  name = each.value
+}
+
+# -----------------------------------------------------------------------------
 # Custom Role Definition: Scoped permissions for Ent Home deployment and runtime
 #
 # This role grants the minimum permissions needed for Ent Home to:
