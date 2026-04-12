@@ -27,3 +27,19 @@ output "subscription_id" {
   value       = data.azurerm_subscription.current.subscription_id
   description = "The Azure subscription ID"
 }
+
+# OpenSearch App Registration
+output "opensearch_client_id" {
+  value       = azuread_application.opensearch.client_id
+  description = "The client (application) ID of the OpenSearch app registration"
+}
+
+output "opensearch_identifier_uri" {
+  value       = "api://${data.azuread_client_config.current.tenant_id}/opensearch"
+  description = "The Application ID URI for the OpenSearch app registration"
+}
+
+output "opensearch_service_principal_object_id" {
+  value       = azuread_service_principal.opensearch.object_id
+  description = "The object ID of the OpenSearch service principal"
+}
