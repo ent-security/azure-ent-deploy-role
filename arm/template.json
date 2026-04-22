@@ -67,7 +67,6 @@
               "Microsoft.Resources/tags/*"
             ],
             "notActions": [
-              "Microsoft.Authorization/roleAssignments/delete",
               "Microsoft.Authorization/roleDefinitions/write",
               "Microsoft.Authorization/roleDefinitions/delete"
             ],

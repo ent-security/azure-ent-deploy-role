@@ -25,16 +25,21 @@ data "azuread_client_config" "current" {}
 #      but the azure-deploy.yml workflow does NOT declare a GitHub Actions
 #      environment. Changed to configurable var with ref-based default.
 #
-#   5. not_actions blocks roleAssignment delete but still allows creating
-#      assignments with any role (including Owner) — a privilege escalation
-#      path. Documented as accepted risk: the SP operates in a dedicated
-#      subscription, and Azure PIM would be the mitigation for shared subs.
+#   5. roleAssignments/delete is now granted (not blocked via not_actions).
+#      OpenTofu requires delete to replace role assignments when their parent
+#      resource changes — e.g., swapping AI models, renaming resources,
+#      rotating managed identities. Privilege-escalation risk (self-unbind,
+#      reassign Owner) is mitigated by an ABAC condition on the role
+#      assignment below that excludes Owner, User Access Administrator, and
+#      Role Based Access Control Administrator from the roles the SP can
+#      assign or delete.
 #
 # Remaining accepted risks:
 #   - Microsoft.ContainerService/managedClusters/* grants full AKS control
 #     (needed for create/update/delete of cluster + node pools + addons).
 #   - Microsoft.Authorization/roleAssignments/write can assign any built-in
-#     role. Acceptable in a single-tenant subscription.
+#     role *except* the three gated by the ABAC condition. Acceptable in a
+#     single-tenant subscription; Azure PIM is the mitigation for shared subs.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -130,9 +135,11 @@ resource "azurerm_role_definition" "ent_deploy" {
       "Microsoft.Network/dnszones/*",
 
       # ── Managed Identity & RBAC ───────────────────────────────────────
-      # NOTE: roleAssignments/write allows assigning any built-in role,
-      # including Owner. Accepted risk in single-tenant subscriptions.
-      # For shared subscriptions, layer Azure PIM on top.
+      # roleAssignments/* grants write+read+delete, which tofu needs to
+      # replace assignments when parent resources change (model swaps,
+      # MI rotations, etc.). The ABAC condition on the role assignment
+      # below blocks the SP from granting or removing Owner / User Access
+      # Administrator / RBAC Administrator, which are the escalation paths.
       "Microsoft.ManagedIdentity/userAssignedIdentities/*",
       "Microsoft.Authorization/roleAssignments/*",
       "Microsoft.Authorization/roleDefinitions/read",
@@ -157,10 +164,10 @@ resource "azurerm_role_definition" "ent_deploy" {
     ]
 
     not_actions = [
-      # Prevent privilege escalation — block deleting role assignments and
-      # modifying role definitions. The SP can still create assignments
-      # (needed for wiring MI → RBAC in platform module).
-      "Microsoft.Authorization/roleAssignments/delete",
+      # Block modifying role definitions themselves. Role-assignment write+delete
+      # are permitted (see roleAssignments/* in actions above) but gated by the
+      # ABAC condition on the role assignment below, which prevents the SP from
+      # granting or removing the three escalation-enabling built-in roles.
       "Microsoft.Authorization/roleDefinitions/write",
       "Microsoft.Authorization/roleDefinitions/delete",
     ]
@@ -214,11 +221,50 @@ resource "azuread_application_federated_identity_credential" "ent" {
   subject        = "repo:${var.github_repository}:ref:${var.github_ref}"
 }
 
-# Bind the custom role to the service principal at subscription scope
+# Bind the custom role to the service principal at subscription scope.
+#
+# ABAC condition blocks privilege escalation: the SP can write and delete role
+# assignments (needed for tofu to replace them when parent resources change)
+# but NOT for Owner, User Access Administrator, or Role Based Access Control
+# Administrator. The two expressions cover write (Request side) and delete
+# (Resource side) per the Microsoft Learn pattern:
+# https://learn.microsoft.com/azure/role-based-access-control/delegate-role-assignments-examples
+locals {
+  # Built-in roles the SP must NOT be able to assign or remove.
+  forbidden_role_guids = [
+    "8e3af657-a8ff-443c-a75c-2fe8c4bcb635", # Owner
+    "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9", # User Access Administrator
+    "f58310d9-a9f6-439a-9e8d-f62e7b41a168", # Role Based Access Control Administrator
+  ]
+}
+
 resource "azurerm_role_assignment" "ent_deploy" {
   scope              = data.azurerm_subscription.current.id
   role_definition_id = azurerm_role_definition.ent_deploy.role_definition_resource_id
   principal_id       = azuread_service_principal.ent.object_id
+
+  condition_version = "2.0"
+  condition = <<-EOT
+    (
+     (
+      !(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})
+     )
+     OR
+     (
+      @Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {${join(", ", local.forbidden_role_guids)}}
+     )
+    )
+    AND
+    (
+     (
+      !(ActionMatches{'Microsoft.Authorization/roleAssignments/delete'})
+     )
+     OR
+     (
+      @Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {${join(", ", local.forbidden_role_guids)}}
+     )
+    )
+  EOT
 }
 
 # -----------------------------------------------------------------------------
