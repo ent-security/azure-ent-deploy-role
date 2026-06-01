@@ -42,6 +42,7 @@
               "Microsoft.Network/publicIPAddresses/*",
               "Microsoft.Network/privateEndpoints/*",
               "Microsoft.Network/privateDnsZones/*",
+              "Microsoft.Network/applicationGateways/*",
               "Microsoft.ContainerService/managedClusters/*",
               "Microsoft.ContainerService/locations/*",
               "Microsoft.ContainerRegistry/registries/*",
