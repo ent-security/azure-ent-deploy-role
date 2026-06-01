@@ -106,6 +106,7 @@ az role definition create --role-definition '{
     "Microsoft.Network/publicIPAddresses/*",
     "Microsoft.Network/privateEndpoints/*",
     "Microsoft.Network/privateDnsZones/*",
+    "Microsoft.Network/applicationGateways/*",
     "Microsoft.Network/dnszones/*",
     "Microsoft.ContainerService/managedClusters/*",
     "Microsoft.ContainerService/locations/*",
@@ -195,7 +196,7 @@ This role grants permissions to manage the following Azure services:
 | Service | Resource Provider | Scope |
 |---------|-------------------|-------|
 | Resource Groups | `Microsoft.Resources` | CRUD |
-| Virtual Network | `Microsoft.Network` | Full (VNet, Subnet, NSG, NAT, Public IP) |
+| Virtual Network | `Microsoft.Network` | Full (VNet, Subnet, NSG, NAT, Public IP, App Gateway) |
 | Private Endpoints | `Microsoft.Network` | Full (Private DNS, endpoints) |
 | DNS Zones | `Microsoft.Network` | Full |
 | AKS | `Microsoft.ContainerService` | Full |
