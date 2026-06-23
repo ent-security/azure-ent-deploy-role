@@ -21,17 +21,52 @@ no Terraform/OpenTofu required.
 - **Azure CLI** `az` >= 2.37 (needs `az ad app federated-credential`), authenticated with `az login`.
 - Rights to create a custom role definition in the subscription **and** app registrations in the tenant — e.g. **Owner** + **Application Administrator**, or equivalent.
 
-## Usage
+## First-time setup
 
-```bash
-./setup.sh --subscription <your-subscription-id>
-```
+Run this once per Azure subscription you want Ent to deploy into, from an account
+with **Owner** on the subscription plus rights to create app registrations in the
+tenant (see [Prerequisites](#prerequisites)).
 
-The script is **idempotent** — safe to re-run. Each step checks for the existing
-object before creating it, so a second run reconciles rather than failing.
+1. **Clone the repo and sign in to Azure:**
 
-When it finishes, paste the printed **`application_client_id`** and **`tenant_id`**
-into the Azure connection panel in Ent onboarding, then click **Save & Test Connection**.
+   ```bash
+   git clone https://github.com/ent-security/azure-ent-deploy-role.git
+   cd azure-ent-deploy-role
+   az login
+   ```
+
+2. **Run the setup script** against your target subscription:
+
+   ```bash
+   ./setup.sh --subscription <your-subscription-id>
+   ```
+
+   It registers the required resource providers and creates the custom role, the
+   `ent-platform-deploy` app registration + service principal, the two keyless
+   federated credentials, the ABAC-gated role assignment, and the OpenSearch app.
+   It is **idempotent** — safe to re-run; each step reconciles an existing object
+   instead of failing.
+
+3. **Copy the two values it prints** when it finishes:
+
+   ```
+   ✓ Setup complete.
+
+   Paste these two values into the Azure connection panel in Ent onboarding:
+
+     application_client_id : 11111111-2222-3333-4444-555555555555
+     tenant_id             : 66666666-7777-8888-9999-000000000000
+   ```
+
+   (It also prints the subscription ID, service-principal object ID, role
+   definition, and OpenSearch IDs for reference.)
+
+4. **In Ent**, open the Azure connection settings page, enter the
+   **`application_client_id`**, **`tenant_id`**, and your **Subscription ID**, then
+   click **Save & Test Connection**.
+
+No client secret is ever created or stored — Ent authenticates through the
+federated credentials (see [Authentication](#authentication-no-client-secret)).
 
 ### Options
 
@@ -84,13 +119,6 @@ az ad app federated-credential create --id "$APP_OBJECT_ID" --parameters '{
   "audiences": ["api://AzureADTokenExchange"]
 }'
 ```
-
-## Setup
-
-1. Run `./setup.sh --subscription <your-subscription-id>`.
-2. Open the Azure connection settings page in Ent.
-3. Enter the **`application_client_id`** and **`tenant_id`** the script prints (plus your **Subscription ID**).
-4. Click **Save & Test Connection**.
 
 ## Permissions
 
