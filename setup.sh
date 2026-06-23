@@ -248,9 +248,13 @@ ENT_SP_OBJECT_ID="$("${AZ[@]}" ad sp show --id "$ENT_APP_ID" --query id -o tsv)"
 
 # ── 4. Federated identity credentials (keyless) ───────────────────────────────
 ensure_fic() {
-  # $1 name, $2 issuer, $3 subject
-  if [[ -n "$("${AZ[@]}" ad app federated-credential list --id "$ENT_APP_OBJECT_ID" --query "[?name=='$1'].name | [0]" -o tsv)" ]]; then
-    echo "  fic '$1' already present"
+  # $1 name, $2 issuer, $3 subject.
+  # Azure enforces uniqueness on issuer+subject (not name), so match that combo —
+  # an equivalent credential may already exist under a different name.
+  local existing
+  existing="$("${AZ[@]}" ad app federated-credential list --id "$ENT_APP_OBJECT_ID" --query "[?issuer=='$2' && subject=='$3'].name | [0]" -o tsv)"
+  if [[ -n "$existing" ]]; then
+    echo "  fic for this issuer+subject already present (name: $existing) — skipping '$1'"
     return
   fi
   cat >"$WORKDIR/fic.json" <<JSON
@@ -321,6 +325,11 @@ fi
 # ── 6. OpenSearch app registration + service principal ────────────────────────
 log "Ensuring OpenSearch app registration: ${SP_NAME}-opensearch"
 OS_APP_ID="$("${AZ[@]}" ad app list --display-name "${SP_NAME}-opensearch" --query "[0].appId" -o tsv)"
+if [[ -z "$OS_APP_ID" ]]; then
+  # Fall back to the identifier URI (uniqueness-constrained): an equivalent
+  # OpenSearch app may already exist under a different display name.
+  OS_APP_ID="$("${AZ[@]}" ad app list --identifier-uri "api://${TENANT_ID}/opensearch" --query "[0].appId" -o tsv)"
+fi
 if [[ -z "$OS_APP_ID" ]]; then
   cat >"$WORKDIR/approles.json" <<JSON
 [
