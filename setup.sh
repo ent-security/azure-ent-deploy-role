@@ -215,6 +215,8 @@ cat >"$WORKDIR/role.json" <<JSON
   ],
   "DataActions": [
     "Microsoft.KeyVault/vaults/secrets/*",
+    "Microsoft.KeyVault/vaults/certificates/*",
+    "Microsoft.KeyVault/vaults/keys/*",
     "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/*",
     "Microsoft.ServiceBus/namespaces/messages/*",
     "Microsoft.CognitiveServices/accounts/OpenAI/*",

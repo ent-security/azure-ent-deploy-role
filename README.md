@@ -106,7 +106,7 @@ The custom role grants permissions to manage the following Azure services:
 | Container Registry | `Microsoft.ContainerRegistry` | Full |
 | PostgreSQL Flexible Server | `Microsoft.DBforPostgreSQL` | Full |
 | Redis | `Microsoft.Cache` | Full (classic Redis only) |
-| Key Vault | `Microsoft.KeyVault` | Full (control + data plane) |
+| Key Vault | `Microsoft.KeyVault` | Full (control + data plane: secrets, certificates, keys) |
 | Storage Accounts | `Microsoft.Storage` | Full (control + data plane) |
 | Service Bus | `Microsoft.ServiceBus` | Full (control + data plane) |
 | AI Services | `Microsoft.CognitiveServices` | Full (control + data plane) |
