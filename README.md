@@ -42,7 +42,7 @@ into the Azure connection panel in Ent onboarding, then click **Save & Test Conn
 | `--sp-name` | App registration / service principal display name | `ent-platform-deploy` |
 | `--github-repository` | GitHub repo (`owner/repo`) for the Actions OIDC credential | `ent-security/ent-platform` |
 | `--github-ref` | Git ref for the Actions credential | `refs/heads/main` |
-| `--env` | Ent home cluster the EKS credential trusts: `prod` or `dev` | `prod` |
+| `--env` | Ent home cluster the EKS credential trusts: `prod` or `dev`. `dev` provisions a separate `-dev` identity (see note). | `prod` |
 | `--eks-oidc-issuer` | Explicit EKS OIDC issuer URL (advanced; not combinable with `--env`) | _(resolved from `--env`)_ |
 | `--deploy-sa-subject` | Kubernetes service-account subject for the EKS credential | `system:serviceaccount:ent-home:ent-home-api` |
 
@@ -51,6 +51,11 @@ customer trusts Ent's home-**prod** cluster. `--env dev` exists only for
 Ent-internal testing against the home-dev cluster and must **never** be used for a
 customer tenant; `--eks-oidc-issuer` is an escape hatch for any other cluster. The
 `--deploy-sa-subject` default is a frozen, fleet-wide contract pinned by Ent.
+
+`--env dev` provisions a **fully separate `ent-platform-deploy-dev` identity** — its
+own app registration, service principal, federated credentials, and OpenSearch app
+(`api://<tenant>/opensearch-dev`) — so internal dev testing never collides with the
+home/prod deploy app. Pass `--sp-name` to override the app name.
 
 ## Authentication (no client secret)
 

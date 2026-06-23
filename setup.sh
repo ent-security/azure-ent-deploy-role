@@ -35,7 +35,7 @@ set -euo pipefail
 # ── Frozen, fleet-wide contracts pinned by Ent (override only if you know why) ─
 ROLE_NAME="Ent Platform Deploy Role"
 ROLE_DESCRIPTION="Custom role that grants Ent permissions to deploy and manage infrastructure in this subscription"
-SP_NAME="ent-platform-deploy"
+SP_NAME=""            # default: ent-platform-deploy (suffixed -dev for --env dev)
 GITHUB_REPOSITORY="ent-security/ent-platform"
 GITHUB_REF="refs/heads/main"
 DEPLOY_SA_SUBJECT="system:serviceaccount:ent-home:ent-home-api"
@@ -118,8 +118,18 @@ if [[ ! "$EKS_OIDC_ISSUER" =~ $EKS_ISSUER_RE ]]; then
   echo "ERROR: EKS issuer must look like https://oidc.eks.<region>.amazonaws.com/id/<OIDC_ID>; got: $EKS_OIDC_ISSUER" >&2
   exit 1
 fi
+IS_DEV=false
 if [[ "$EKS_OIDC_ISSUER" == "$DEV_EKS_OIDC_ISSUER" ]]; then
+  IS_DEV=true
   echo "WARNING: trusting the Ent home-DEV EKS cluster — Ent-internal testing only; never a customer tenant." >&2
+fi
+
+# Default the app/SP name. Dev gets a fully separate '-dev' identity (its own app
+# registration, service principal, federated credentials, and OpenSearch app) so
+# it never collides with the home/prod app. An explicit --sp-name overrides this.
+if [[ -z "$SP_NAME" ]]; then
+  SP_NAME="ent-platform-deploy"
+  if [[ "$IS_DEV" == true ]]; then SP_NAME="${SP_NAME}-dev"; fi
 fi
 
 if ! command -v az >/dev/null 2>&1; then
@@ -324,11 +334,14 @@ fi
 
 # ── 6. OpenSearch app registration + service principal ────────────────────────
 log "Ensuring OpenSearch app registration: ${SP_NAME}-opensearch"
+# Dev gets its own identifier URI so its OpenSearch app stays isolated from home's.
+OS_URI="api://${TENANT_ID}/opensearch"
+if [[ "$IS_DEV" == true ]]; then OS_URI="${OS_URI}-dev"; fi
 OS_APP_ID="$("${AZ[@]}" ad app list --display-name "${SP_NAME}-opensearch" --query "[0].appId" -o tsv)"
 if [[ -z "$OS_APP_ID" ]]; then
   # Fall back to the identifier URI (uniqueness-constrained): an equivalent
   # OpenSearch app may already exist under a different display name.
-  OS_APP_ID="$("${AZ[@]}" ad app list --identifier-uri "api://${TENANT_ID}/opensearch" --query "[0].appId" -o tsv)"
+  OS_APP_ID="$("${AZ[@]}" ad app list --identifier-uri "$OS_URI" --query "[0].appId" -o tsv)"
 fi
 if [[ -z "$OS_APP_ID" ]]; then
   cat >"$WORKDIR/approles.json" <<JSON
@@ -354,7 +367,7 @@ JSON
   OS_APP_ID="$("${AZ[@]}" ad app create \
     --display-name "${SP_NAME}-opensearch" \
     --sign-in-audience AzureADMyOrg \
-    --identifier-uris "api://${TENANT_ID}/opensearch" \
+    --identifier-uris "$OS_URI" \
     --app-roles "@$WORKDIR/approles.json" \
     --query appId -o tsv)"
   echo "  created OpenSearch app ($OS_APP_ID)"
@@ -389,6 +402,6 @@ Other outputs (for reference):
   role_definition_name                   : ${ROLE_NAME}
   role_definition_id                     : ${ROLE_DEF_ID}
   opensearch_client_id                   : ${OS_APP_ID}
-  opensearch_identifier_uri              : api://${TENANT_ID}/opensearch
+  opensearch_identifier_uri              : ${OS_URI}
   opensearch_service_principal_object_id : ${OS_SP_OBJECT_ID}
 OUT
