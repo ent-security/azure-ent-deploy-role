@@ -12,7 +12,8 @@
 #   3. App registration + service principal ("ent-platform-deploy")
 #   4. Two federated identity credentials — NO client secret is ever created:
 #        - GitHub Actions OIDC (ent-platform deploy workflow)
-#        - EKS workload identity (Ent Home deploy job, home-prod cluster)
+#        - EKS workload identity (Ent Home deploy job; home-prod by default,
+#          --env dev for Ent-internal testing only)
 #   5. Role assignment binding the role to the SP, gated by an ABAC condition
 #      that blocks granting/removing Owner, User Access Administrator, and
 #      Role Based Access Control Administrator (privilege-escalation guard).
@@ -37,8 +38,15 @@ ROLE_DESCRIPTION="Custom role that grants Ent permissions to deploy and manage i
 SP_NAME="ent-platform-deploy"
 GITHUB_REPOSITORY="ent-security/ent-platform"
 GITHUB_REF="refs/heads/main"
-EKS_OIDC_ISSUER="https://oidc.eks.us-west-1.amazonaws.com/id/98DF15409F88BD228838D6794CA04EAD"
 DEPLOY_SA_SUBJECT="system:serviceaccount:ent-home:ent-home-api"
+
+# Known Ent home-cluster EKS OIDC issuers. Customer tenants ALWAYS trust prod;
+# dev is for Ent-internal testing only and must never be used for a customer.
+PROD_EKS_OIDC_ISSUER="https://oidc.eks.us-west-1.amazonaws.com/id/98DF15409F88BD228838D6794CA04EAD"
+DEV_EKS_OIDC_ISSUER="https://oidc.eks.us-west-1.amazonaws.com/id/B86CB0977AB2E6A4A50182E607F3B4D7"
+
+EKS_ENV=""            # --env prod|dev  (defaults to prod)
+EKS_OIDC_ISSUER=""    # explicit --eks-oidc-issuer override (advanced; not combinable with --env)
 
 SUBSCRIPTION_ID=""
 
@@ -60,7 +68,10 @@ Overrides (frozen contracts — change only if you know why):
   --sp-name <name>            App registration / service principal display name.
   --github-repository <o/r>   GitHub repo for the Actions OIDC federated credential.
   --github-ref <ref>          Git ref for the Actions federated credential.
-  --eks-oidc-issuer <url>     EKS OIDC issuer URL for the workload-identity credential.
+  --env <prod|dev>            Ent home cluster the EKS credential trusts (default:
+                              prod). 'dev' is Ent-internal only — never a customer.
+  --eks-oidc-issuer <url>     Explicit EKS OIDC issuer URL (advanced; not
+                              combinable with --env).
   --deploy-sa-subject <sub>   Kubernetes service-account subject for the EKS credential.
   -h, --help                  Show this help.
 
@@ -76,6 +87,7 @@ while [[ $# -gt 0 ]]; do
     --sp-name)                 SP_NAME="$2"; shift 2 ;;
     --github-repository)       GITHUB_REPOSITORY="$2"; shift 2 ;;
     --github-ref)              GITHUB_REF="$2"; shift 2 ;;
+    --env)                     EKS_ENV="$2"; shift 2 ;;
     --eks-oidc-issuer)         EKS_OIDC_ISSUER="$2"; shift 2 ;;
     --deploy-sa-subject)       DEPLOY_SA_SUBJECT="$2"; shift 2 ;;
     -h|--help)                 usage 0 ;;
@@ -86,6 +98,28 @@ done
 if [[ -z "$SUBSCRIPTION_ID" ]]; then
   echo "ERROR: --subscription <subscription-id> is required." >&2
   usage 1
+fi
+
+# Resolve the EKS OIDC issuer: an explicit --eks-oidc-issuer wins; otherwise pick
+# by --env. The two are mutually exclusive to avoid ambiguity.
+if [[ -n "$EKS_OIDC_ISSUER" && -n "$EKS_ENV" ]]; then
+  echo "ERROR: pass either --env or --eks-oidc-issuer, not both." >&2
+  exit 1
+fi
+if [[ -z "$EKS_OIDC_ISSUER" ]]; then
+  case "${EKS_ENV:-prod}" in
+    prod) EKS_OIDC_ISSUER="$PROD_EKS_OIDC_ISSUER" ;;
+    dev)  EKS_OIDC_ISSUER="$DEV_EKS_OIDC_ISSUER" ;;
+    *)    echo "ERROR: --env must be 'prod' or 'dev' (got '$EKS_ENV')." >&2; exit 1 ;;
+  esac
+fi
+EKS_ISSUER_RE='^https://oidc\.eks\.[a-z0-9-]+\.amazonaws\.com/id/[A-F0-9]+$'
+if [[ ! "$EKS_OIDC_ISSUER" =~ $EKS_ISSUER_RE ]]; then
+  echo "ERROR: EKS issuer must look like https://oidc.eks.<region>.amazonaws.com/id/<OIDC_ID>; got: $EKS_OIDC_ISSUER" >&2
+  exit 1
+fi
+if [[ "$EKS_OIDC_ISSUER" == "$DEV_EKS_OIDC_ISSUER" ]]; then
+  echo "WARNING: trusting the Ent home-DEV EKS cluster — Ent-internal testing only; never a customer tenant." >&2
 fi
 
 if ! command -v az >/dev/null 2>&1; then
@@ -222,7 +256,7 @@ JSON
   echo "  created fic '$1'"
 }
 
-log "Configuring federated credentials (no client secret)"
+log "Configuring federated credentials (no client secret) — EKS issuer: $EKS_OIDC_ISSUER"
 ensure_fic "ent-home-federated" "https://token.actions.githubusercontent.com" "repo:${GITHUB_REPOSITORY}:ref:${GITHUB_REF}"
 ensure_fic "ent-home-eks-federated" "$EKS_OIDC_ISSUER" "$DEPLOY_SA_SUBJECT"
 

@@ -42,12 +42,15 @@ into the Azure connection panel in Ent onboarding, then click **Save & Test Conn
 | `--sp-name` | App registration / service principal display name | `ent-platform-deploy` |
 | `--github-repository` | GitHub repo (`owner/repo`) for the Actions OIDC credential | `ent-security/ent-platform` |
 | `--github-ref` | Git ref for the Actions credential | `refs/heads/main` |
-| `--eks-oidc-issuer` | EKS OIDC issuer URL for the workload-identity credential | `https://oidc.eks.us-west-1.amazonaws.com/id/98DF15409F88BD228838D6794CA04EAD` |
+| `--env` | Ent home cluster the EKS credential trusts: `prod` or `dev` | `prod` |
+| `--eks-oidc-issuer` | Explicit EKS OIDC issuer URL (advanced; not combinable with `--env`) | _(resolved from `--env`)_ |
 | `--deploy-sa-subject` | Kubernetes service-account subject for the EKS credential | `system:serviceaccount:ent-home:ent-home-api` |
 
-The `eks-oidc-issuer` and `deploy-sa-subject` defaults are **frozen, fleet-wide
-contracts pinned by Ent** — identical for every customer. Leave them at their
-defaults unless Ent tells you otherwise.
+For customer onboarding, **leave the EKS settings at their defaults** — every
+customer trusts Ent's home-**prod** cluster. `--env dev` exists only for
+Ent-internal testing against the home-dev cluster and must **never** be used for a
+customer tenant; `--eks-oidc-issuer` is an escape hatch for any other cluster. The
+`--deploy-sa-subject` default is a frozen, fleet-wide contract pinned by Ent.
 
 ## Authentication (no client secret)
 
@@ -55,7 +58,7 @@ The service principal is configured with **two federated identity credentials** 
 both keyless. No client secret is ever created or stored.
 
 1. **GitHub Actions OIDC** — issuer `https://token.actions.githubusercontent.com`, used by Ent's `ent-platform` deploy workflow. Scoped by `--github-repository` / `--github-ref`.
-2. **EKS workload identity** — issuer `--eks-oidc-issuer`, used by the Ent Home deploy job running in Ent's home-prod EKS cluster. The pod presents a projected service-account token (audience `api://AzureADTokenExchange`); Microsoft Entra exchanges it for an ARM access token in your tenant. The issuer and the subject (`--deploy-sa-subject`) are **exact-match** values — frozen, fleet-wide contracts.
+2. **EKS workload identity** — issuer selected by `--env` (default home-**prod**), used by the Ent Home deploy job running in Ent's home EKS cluster. The pod presents a projected service-account token (audience `api://AzureADTokenExchange`); Microsoft Entra exchanges it for an ARM access token in your tenant. The issuer and the subject (`--deploy-sa-subject`) are **exact-match** values — frozen, fleet-wide contracts.
 
 Both credentials authenticate as the same service principal, so the two outputs
 you paste into Ent onboarding (`application_client_id`, `tenant_id`) cover both paths.
