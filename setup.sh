@@ -155,7 +155,7 @@ for ns in \
 done
 
 # ── 2. Custom role definition ─────────────────────────────────────────────────
-log "Creating/updating custom role definition: $ROLE_NAME"
+log "Ensuring custom role definition: $ROLE_NAME"
 cat >"$WORKDIR/role.json" <<JSON
 {
   "Name": "${ROLE_NAME}",
@@ -216,8 +216,12 @@ cat >"$WORKDIR/role.json" <<JSON
 JSON
 
 if [[ -n "$("${AZ[@]}" role definition list --name "$ROLE_NAME" --scope "$SCOPE" --query "[0].name" -o tsv)" ]]; then
-  "${AZ[@]}" role definition update --role-definition "@$WORKDIR/role.json" >/dev/null
-  echo "  updated existing role definition"
+  # Reuse an existing role as-is — do NOT update it. Updating requires write on
+  # every scope in the role's assignableScopes; if the role already spans a
+  # subscription you can't write to (a shared / multi-sub role), the update
+  # fails with LinkedAuthorizationFailed. Pass --role-name to create a separate
+  # single-subscription role instead of touching the shared one.
+  echo "  reusing existing role definition '$ROLE_NAME' (left unmodified)"
 else
   "${AZ[@]}" role definition create --role-definition "@$WORKDIR/role.json" >/dev/null
   echo "  created role definition"
