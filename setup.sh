@@ -127,7 +127,12 @@ if ! command -v az >/dev/null 2>&1; then
   exit 1
 fi
 
-AZ=(az --only-show-errors)
+# Quiet az's warning-level chatter. Set it via the config env var rather than the
+# --only-show-errors global flag: recent az (2.87) rejects that flag when it
+# precedes the command group (`az --only-show-errors account set` → "'set' is
+# misspelled"), and a prefix array always places it there.
+export AZURE_CORE_ONLY_SHOW_ERRORS=true
+AZ=(az)
 SCOPE="/subscriptions/${SUBSCRIPTION_ID}"
 
 "${AZ[@]}" account set --subscription "$SUBSCRIPTION_ID"
@@ -144,7 +149,7 @@ for ns in \
   Microsoft.ContainerService Microsoft.DBforPostgreSQL Microsoft.Cache \
   Microsoft.ContainerRegistry Microsoft.ServiceBus Microsoft.Storage \
   Microsoft.KeyVault Microsoft.Network Microsoft.ManagedIdentity \
-  Microsoft.Compute Microsoft.Resources; do
+  Microsoft.Compute Microsoft.CognitiveServices Microsoft.Resources; do
   echo "  - $ns"
   "${AZ[@]}" provider register --namespace "$ns" --subscription "$SUBSCRIPTION_ID" >/dev/null
 done
