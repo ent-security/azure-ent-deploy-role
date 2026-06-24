@@ -2,11 +2,12 @@
 
 One-time, manual setup that creates the Ent Security deployment identity in a
 customer Azure subscription. It runs entirely through the **Azure CLI (`az`)** —
-no Terraform/OpenTofu required.
+no Terraform/OpenTofu required. Two equivalent versions are provided:
+**`setup.sh`** (bash — macOS/Linux) and **`setup.ps1`** (PowerShell 7+ — cross-platform).
 
 ## What it creates
 
-`setup.sh` provisions, idempotently:
+Both `setup.sh` and `setup.ps1` provision, idempotently:
 
 - A **custom role definition** (`Ent Platform Deploy Role`) scoped to your subscription.
 - An **app registration + service principal** (`ent-platform-deploy`) that Ent authenticates as.
@@ -20,6 +21,7 @@ no Terraform/OpenTofu required.
 
 - **Azure CLI** `az` >= 2.37 (needs `az ad app federated-credential`), authenticated with `az login`.
 - Rights to create a custom role definition in the subscription **and** app registrations in the tenant — e.g. **Owner** + **Application Administrator**, or equivalent.
+- To run `setup.ps1`: **PowerShell 7+** (`pwsh`). `setup.sh` needs bash.
 
 ## First-time setup
 
@@ -38,7 +40,13 @@ tenant (see [Prerequisites](#prerequisites)).
 2. **Run the setup script** against your target subscription:
 
    ```bash
+   # bash (macOS / Linux)
    ./setup.sh --subscription <your-subscription-id>
+   ```
+
+   ```powershell
+   # PowerShell 7+ (Windows / macOS / Linux)
+   ./setup.ps1 -Subscription <your-subscription-id>
    ```
 
    It registers the required resource providers and creates the custom role, the
@@ -80,6 +88,10 @@ federated credentials (see [Authentication](#authentication-no-client-secret)).
 | `--env` | Ent home cluster the EKS credential trusts: `prod` or `dev`. `dev` provisions a separate `-dev` identity (see note). | `prod` |
 | `--eks-oidc-issuer` | Explicit EKS OIDC issuer URL (advanced; not combinable with `--env`) | _(resolved from `--env`)_ |
 | `--deploy-sa-subject` | Kubernetes service-account subject for the EKS credential | `system:serviceaccount:ent-home:ent-home-api` |
+
+The table shows `setup.sh` flags; `setup.ps1` takes the same options as PowerShell
+parameters — `-Subscription`, `-RoleName`, `-SpName`, `-GithubRepository`,
+`-GithubRef`, `-Env`, `-EksOidcIssuer`, `-DeploySaSubject`.
 
 For customer onboarding, **leave the EKS settings at their defaults** — every
 customer trusts Ent's home-**prod** cluster. `--env dev` exists only for
@@ -156,7 +168,8 @@ Only role *definition* writes are blocked outright:
 
 ```
 azure-ent-deploy-role/
-├── setup.sh
+├── setup.sh          # bash (macOS / Linux)
+├── setup.ps1         # PowerShell 7+
 ├── .gitignore
 └── README.md
 ```
