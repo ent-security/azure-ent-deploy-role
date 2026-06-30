@@ -202,6 +202,7 @@ cat >"$WORKDIR/role.json" <<JSON
     "Microsoft.Authorization/roleDefinitions/read",
     "Microsoft.Resources/subscriptions/providers/read",
     "Microsoft.Compute/skus/read",
+    "Microsoft.Compute/locations/usages/read",
     "Microsoft.CognitiveServices/accounts/*",
     "Microsoft.CognitiveServices/locations/*",
     "Microsoft.CognitiveServices/deployments/*",
