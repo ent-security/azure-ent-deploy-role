@@ -206,12 +206,20 @@ try {
         # broadened to other subscriptions you can't write to, the update can fail with
         # LinkedAuthorizationFailed — warn and continue rather than abort; pass -RoleName to manage a
         # separate single-subscription role instead.
-        try {
-            Invoke-Az role definition update --role-definition "@$rolePath" | Out-Null
+        # Call az directly (not Invoke-Az) so we can capture and surface az's actual error on failure
+        # instead of Invoke-Az's generic "az ... failed" message.
+        $updateOutput = & az role definition update --role-definition "@$rolePath" 2>&1
+        if ($LASTEXITCODE -eq 0) {
             Write-Host "  updated existing role definition '$RoleName'"
         }
-        catch {
-            Write-Host "  WARNING: could not update '$RoleName' (a multi-subscription role you lack write on?); left as-is. Re-run with -RoleName <name> to manage a single-subscription role here."
+        else {
+            # Surface the real error rather than assuming a cause: the expected one is
+            # LinkedAuthorizationFailed on a role broadened to other subscriptions (fix: -RoleName), but a
+            # malformed role or auth failure lands here too and the operator needs the real message.
+            Write-Host "  WARNING: could not update role definition '$RoleName'; leaving it as-is. If this is a"
+            Write-Host "           shared multi-subscription role you lack write on (LinkedAuthorizationFailed),"
+            Write-Host "           re-run with -RoleName <name> for a separate single-subscription role. az error:"
+            Write-Host (($updateOutput | Out-String).TrimEnd())
         }
     }
     else {

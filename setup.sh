@@ -235,11 +235,16 @@ if [[ -n "$("${AZ[@]}" role definition list --name "$ROLE_NAME" --scope "$SCOPE"
   # manually broadened to other subscriptions you can't write to, `az role definition update` can fail
   # with LinkedAuthorizationFailed — warn and continue rather than abort the whole setup; pass --role-name
   # to manage a separate single-subscription role instead.
-  if "${AZ[@]}" role definition update --role-definition "@$WORKDIR/role.json" >/dev/null 2>&1; then
+  if update_err="$("${AZ[@]}" role definition update --role-definition "@$WORKDIR/role.json" 2>&1)"; then
     echo "  updated existing role definition '$ROLE_NAME'"
   else
-    echo "  WARNING: could not update '$ROLE_NAME' (a multi-subscription role you lack write on?); left" >&2
-    echo "           as-is. Re-run with --role-name <name> to manage a single-subscription role here." >&2
+    # Surface az's actual error rather than assuming a cause: the expected one is LinkedAuthorizationFailed
+    # on a role manually broadened to other subscriptions (fix: --role-name), but a malformed role or auth
+    # failure lands here too and the operator needs the real message to tell them apart.
+    echo "  WARNING: could not update role definition '$ROLE_NAME'; leaving it as-is. If this is a shared" >&2
+    echo "           multi-subscription role you lack write on (LinkedAuthorizationFailed), re-run with" >&2
+    echo "           --role-name <name> for a separate single-subscription role. az error:" >&2
+    printf '%s\n' "$update_err" | sed 's/^/             /' >&2
   fi
 else
   "${AZ[@]}" role definition create --role-definition "@$WORKDIR/role.json" >/dev/null
