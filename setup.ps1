@@ -171,6 +171,7 @@ try {
     "Microsoft.Authorization/roleDefinitions/read",
     "Microsoft.Resources/subscriptions/providers/read",
     "Microsoft.Compute/skus/read",
+    "Microsoft.Compute/locations/usages/read",
     "Microsoft.CognitiveServices/accounts/*",
     "Microsoft.CognitiveServices/locations/*",
     "Microsoft.CognitiveServices/deployments/*",
@@ -199,12 +200,27 @@ try {
     [System.IO.File]::WriteAllText($rolePath, $roleJson)
 
     if (Invoke-Az role definition list --name $RoleName --scope $Scope --query "[0].name" -o tsv) {
-        # Reuse an existing role as-is — do NOT update it. Updating requires write
-        # on every scope in the role's assignableScopes; if the role already spans
-        # a subscription you can't write to (a shared / multi-sub role), the update
-        # fails with LinkedAuthorizationFailed. Pass -RoleName to create a separate
-        # single-subscription role instead of touching the shared one.
-        Write-Host "  reusing existing role definition '$RoleName' (left unmodified)"
+        # Reconcile the existing role so a re-run picks up permission changes (new Actions) — otherwise a
+        # permission added to an already-onboarded subscription's role would never land. The role is
+        # scoped to this one subscription, so the update needs write only here. If it was manually
+        # broadened to other subscriptions you can't write to, the update can fail with
+        # LinkedAuthorizationFailed — warn and continue rather than abort; pass -RoleName to manage a
+        # separate single-subscription role instead.
+        # Call az directly (not Invoke-Az) so we can capture and surface az's actual error on failure
+        # instead of Invoke-Az's generic "az ... failed" message.
+        $updateOutput = & az role definition update --role-definition "@$rolePath" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  updated existing role definition '$RoleName'"
+        }
+        else {
+            # Surface the real error rather than assuming a cause: the expected one is
+            # LinkedAuthorizationFailed on a role broadened to other subscriptions (fix: -RoleName), but a
+            # malformed role or auth failure lands here too and the operator needs the real message.
+            Write-Host "  WARNING: could not update role definition '$RoleName'; leaving it as-is. If this is a"
+            Write-Host "           shared multi-subscription role you lack write on (LinkedAuthorizationFailed),"
+            Write-Host "           re-run with -RoleName <name> for a separate single-subscription role. az error:"
+            Write-Host (($updateOutput | Out-String).TrimEnd())
+        }
     }
     else {
         Invoke-Az role definition create --role-definition "@$rolePath" | Out-Null

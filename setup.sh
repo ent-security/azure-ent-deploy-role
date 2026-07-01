@@ -202,6 +202,7 @@ cat >"$WORKDIR/role.json" <<JSON
     "Microsoft.Authorization/roleDefinitions/read",
     "Microsoft.Resources/subscriptions/providers/read",
     "Microsoft.Compute/skus/read",
+    "Microsoft.Compute/locations/usages/read",
     "Microsoft.CognitiveServices/accounts/*",
     "Microsoft.CognitiveServices/locations/*",
     "Microsoft.CognitiveServices/deployments/*",
@@ -228,12 +229,23 @@ cat >"$WORKDIR/role.json" <<JSON
 JSON
 
 if [[ -n "$("${AZ[@]}" role definition list --name "$ROLE_NAME" --scope "$SCOPE" --query "[0].name" -o tsv)" ]]; then
-  # Reuse an existing role as-is — do NOT update it. Updating requires write on
-  # every scope in the role's assignableScopes; if the role already spans a
-  # subscription you can't write to (a shared / multi-sub role), the update
-  # fails with LinkedAuthorizationFailed. Pass --role-name to create a separate
-  # single-subscription role instead of touching the shared one.
-  echo "  reusing existing role definition '$ROLE_NAME' (left unmodified)"
+  # Reconcile the existing role so a re-run picks up permission changes (new Actions) — otherwise a
+  # permission added to an already-onboarded subscription's role would never land. The role is scoped to
+  # this one subscription (see AssignableScopes above), so the update needs write only here. If it was
+  # manually broadened to other subscriptions you can't write to, `az role definition update` can fail
+  # with LinkedAuthorizationFailed — warn and continue rather than abort the whole setup; pass --role-name
+  # to manage a separate single-subscription role instead.
+  if update_err="$("${AZ[@]}" role definition update --role-definition "@$WORKDIR/role.json" 2>&1)"; then
+    echo "  updated existing role definition '$ROLE_NAME'"
+  else
+    # Surface az's actual error rather than assuming a cause: the expected one is LinkedAuthorizationFailed
+    # on a role manually broadened to other subscriptions (fix: --role-name), but a malformed role or auth
+    # failure lands here too and the operator needs the real message to tell them apart.
+    echo "  WARNING: could not update role definition '$ROLE_NAME'; leaving it as-is. If this is a shared" >&2
+    echo "           multi-subscription role you lack write on (LinkedAuthorizationFailed), re-run with" >&2
+    echo "           --role-name <name> for a separate single-subscription role. az error:" >&2
+    printf '%s\n' "$update_err" | sed 's/^/             /' >&2
+  fi
 else
   "${AZ[@]}" role definition create --role-definition "@$WORKDIR/role.json" >/dev/null
   echo "  created role definition"
