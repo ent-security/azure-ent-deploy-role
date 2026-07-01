@@ -200,12 +200,19 @@ try {
     [System.IO.File]::WriteAllText($rolePath, $roleJson)
 
     if (Invoke-Az role definition list --name $RoleName --scope $Scope --query "[0].name" -o tsv) {
-        # Reuse an existing role as-is — do NOT update it. Updating requires write
-        # on every scope in the role's assignableScopes; if the role already spans
-        # a subscription you can't write to (a shared / multi-sub role), the update
-        # fails with LinkedAuthorizationFailed. Pass -RoleName to create a separate
-        # single-subscription role instead of touching the shared one.
-        Write-Host "  reusing existing role definition '$RoleName' (left unmodified)"
+        # Reconcile the existing role so a re-run picks up permission changes (new Actions) — otherwise a
+        # permission added to an already-onboarded subscription's role would never land. The role is
+        # scoped to this one subscription, so the update needs write only here. If it was manually
+        # broadened to other subscriptions you can't write to, the update can fail with
+        # LinkedAuthorizationFailed — warn and continue rather than abort; pass -RoleName to manage a
+        # separate single-subscription role instead.
+        try {
+            Invoke-Az role definition update --role-definition "@$rolePath" | Out-Null
+            Write-Host "  updated existing role definition '$RoleName'"
+        }
+        catch {
+            Write-Host "  WARNING: could not update '$RoleName' (a multi-subscription role you lack write on?); left as-is. Re-run with -RoleName <name> to manage a single-subscription role here."
+        }
     }
     else {
         Invoke-Az role definition create --role-definition "@$rolePath" | Out-Null

@@ -229,12 +229,18 @@ cat >"$WORKDIR/role.json" <<JSON
 JSON
 
 if [[ -n "$("${AZ[@]}" role definition list --name "$ROLE_NAME" --scope "$SCOPE" --query "[0].name" -o tsv)" ]]; then
-  # Reuse an existing role as-is — do NOT update it. Updating requires write on
-  # every scope in the role's assignableScopes; if the role already spans a
-  # subscription you can't write to (a shared / multi-sub role), the update
-  # fails with LinkedAuthorizationFailed. Pass --role-name to create a separate
-  # single-subscription role instead of touching the shared one.
-  echo "  reusing existing role definition '$ROLE_NAME' (left unmodified)"
+  # Reconcile the existing role so a re-run picks up permission changes (new Actions) — otherwise a
+  # permission added to an already-onboarded subscription's role would never land. The role is scoped to
+  # this one subscription (see AssignableScopes above), so the update needs write only here. If it was
+  # manually broadened to other subscriptions you can't write to, `az role definition update` can fail
+  # with LinkedAuthorizationFailed — warn and continue rather than abort the whole setup; pass --role-name
+  # to manage a separate single-subscription role instead.
+  if "${AZ[@]}" role definition update --role-definition "@$WORKDIR/role.json" >/dev/null 2>&1; then
+    echo "  updated existing role definition '$ROLE_NAME'"
+  else
+    echo "  WARNING: could not update '$ROLE_NAME' (a multi-subscription role you lack write on?); left" >&2
+    echo "           as-is. Re-run with --role-name <name> to manage a single-subscription role here." >&2
+  fi
 else
   "${AZ[@]}" role definition create --role-definition "@$WORKDIR/role.json" >/dev/null
   echo "  created role definition"
