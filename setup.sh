@@ -13,8 +13,9 @@
 #      approved model per tier). Failures prompt before anything is created.
 #   3. Custom role definition ("Ent Platform Deploy Role")
 #   4. App registration + service principal ("ent-platform-deploy")
-#   5. Two keyless federated identity credentials — GitHub Actions OIDC + Ent
-#      Home EKS workload identity (--env dev is Ent-internal only)
+#   5. A keyless federated identity credential trusting the Ent Home (EKS)
+#      deploy path — the only identity customers trust (--env dev is
+#      Ent-internal only)
 #   6. Role assignment, ABAC-gated to block granting/removing Owner, User
 #      Access Administrator, and RBAC Administrator (escalation guard)
 #   7. OpenSearch app registration + service principal (os_admin / os_reader)
@@ -37,8 +38,6 @@ set -euo pipefail
 ROLE_NAME="Ent Platform Deploy Role"
 ROLE_DESCRIPTION="Custom role that grants Ent permissions to deploy and manage infrastructure in this subscription"
 SP_NAME=""            # default: ent-platform-deploy (suffixed -dev for --env dev)
-GITHUB_REPOSITORY="ent-security/ent-platform"
-GITHUB_REF="refs/heads/main"
 DEPLOY_SA_SUBJECT="system:serviceaccount:ent-home:ent-home-api"
 
 # Known Ent home-cluster EKS OIDC issuers. Customer tenants ALWAYS trust prod;
@@ -103,8 +102,6 @@ Subscription:
 Overrides (frozen contracts — change only if you know why):
   --role-name <name>          Custom role display name.
   --sp-name <name>            App registration / service principal display name.
-  --github-repository <o/r>   GitHub repo for the Actions OIDC federated credential.
-  --github-ref <ref>          Git ref for the Actions federated credential.
   --env <prod|dev>            Ent home cluster the EKS credential trusts (default:
                               prod). 'dev' is Ent-internal only — never a customer.
   --eks-oidc-issuer <url>     Explicit EKS OIDC issuer URL (advanced; not
@@ -139,8 +136,6 @@ while [[ $# -gt 0 ]]; do
     -s|--subscription)         SUBSCRIPTION_ID="$2"; shift 2 ;;
     --role-name)               ROLE_NAME="$2"; shift 2 ;;
     --sp-name)                 SP_NAME="$2"; shift 2 ;;
-    --github-repository)       GITHUB_REPOSITORY="$2"; shift 2 ;;
-    --github-ref)              GITHUB_REF="$2"; shift 2 ;;
     --env)                     EKS_ENV="$2"; shift 2 ;;
     --eks-oidc-issuer)         EKS_OIDC_ISSUER="$2"; shift 2 ;;
     --deploy-sa-subject)       DEPLOY_SA_SUBJECT="$2"; shift 2 ;;
@@ -589,8 +584,8 @@ JSON
   echo "  created fic '$1'"
 }
 
-log "Configuring federated credentials (no client secret) — EKS issuer: $EKS_OIDC_ISSUER"
-ensure_fic "ent-home-federated" "https://token.actions.githubusercontent.com" "repo:${GITHUB_REPOSITORY}:ref:${GITHUB_REF}"
+# Customers trust ONLY the Ent Home (EKS) deploy path — no GitHub Actions trust.
+log "Configuring federated credential (no client secret) — EKS issuer: $EKS_OIDC_ISSUER"
 ensure_fic "ent-home-eks-federated" "$EKS_OIDC_ISSUER" "$DEPLOY_SA_SUBJECT"
 
 # ── 6. Role assignment with ABAC privilege-escalation guard ───────────────────

@@ -17,8 +17,9 @@
        approved model per tier). Failures prompt before anything is created.
     3. Custom role definition ("Ent Platform Deploy Role")
     4. App registration + service principal ("ent-platform-deploy")
-    5. Two keyless federated identity credentials — GitHub Actions OIDC + Ent
-       Home EKS workload identity (-Env dev is Ent-internal only)
+    5. A keyless federated identity credential trusting the Ent Home (EKS)
+       deploy path — the only identity customers trust (-Env dev is
+       Ent-internal only)
     6. Role assignment, ABAC-gated to block granting/removing Owner, User
        Access Administrator, and RBAC Administrator (escalation guard)
     7. OpenSearch app registration + service principal (os_admin / os_reader)
@@ -52,8 +53,6 @@ param(
     [string] $RoleName = 'Ent Platform Deploy Role',
     [string] $RoleDescription = 'Custom role that grants Ent permissions to deploy and manage infrastructure in this subscription',
     [string] $SpName = '',            # default: ent-platform-deploy (suffixed -dev for -Env dev)
-    [string] $GithubRepository = 'ent-security/ent-platform',
-    [string] $GithubRef = 'refs/heads/main',
     [string] $Env = '',               # prod|dev (defaults to prod); not combinable with -EksOidcIssuer
     [string] $EksOidcIssuer = '',     # explicit issuer override (advanced)
     [string] $DeploySaSubject = 'system:serviceaccount:ent-home:ent-home-api'
@@ -579,8 +578,8 @@ try {
         Write-Host "  created fic '$Name'"
     }
 
-    Write-Step "Configuring federated credentials (no client secret) — EKS issuer: $EksOidcIssuer"
-    EnsureFic -Name 'ent-home-federated' -Issuer 'https://token.actions.githubusercontent.com' -Subject "repo:${GithubRepository}:ref:${GithubRef}"
+    # Customers trust ONLY the Ent Home (EKS) deploy path — no GitHub Actions trust.
+    Write-Step "Configuring federated credential (no client secret) — EKS issuer: $EksOidcIssuer"
     EnsureFic -Name 'ent-home-eks-federated' -Issuer $EksOidcIssuer -Subject $DeploySaSubject
 
     # ── 6. Role assignment with ABAC privilege-escalation guard ─────────────────

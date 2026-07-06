@@ -10,26 +10,40 @@ no Terraform/OpenTofu required. Two equivalent versions are provided:
 Both `setup.sh` and `setup.ps1` provision, idempotently:
 
 - **Capacity & quota checks** run first against your chosen region — regional
-  vCPU quota (≥ 150 free), DSv3-family quota for the static AKS system node
-  (`Standard_D8s_v3`), NVIDIA T4/A10 GPU vCPU quota sized per silicon for the
-  serving baseline — **5 full T4 cards** (4 vLLM chat replicas + 1 TEI
-  embeddings; ≥ 20 `NCASt4_v3` vCPUs) or **3 full A10 cards** (2 chat replicas
-  + 1 TEI, since A10's bf16/batch-32 profile needs fewer pods; ≥ 108
-  `NVADSA10v5` or ≥ 96 `NCADSA10v4` vCPUs); a failure lists the exact quota
-  families/SKUs to request — and Azure AI Foundry catalog availability + TPM
-  headroom for the benchmark-approved serving models, where any **one** model
-  per tier is enough: normal tier `gpt-5.1`, `gpt-5.2`, `gpt-4.1`, `gpt-5`, or
-  `gpt-5-mini`; fast tier `gpt-4.1-mini` or `gpt-5-nano` (pinned versions where
-  established). Any failure prompts before anything is created. Note: TPM quota
-  counts allocations held by *existing* deployments of the model in the
-  subscription+region, even idle ones.
+  and DSv3 system-node vCPU quota, NVIDIA T4/A10 GPU quota (only one family
+  needs to pass), and Azure AI Foundry catalog + TPM headroom for the
+  benchmark-approved serving models (only one model per tier needs to pass).
+  See [Quota requirements](#quota-requirements). Any failure prompts before
+  anything is created.
 - A **custom role definition** (`Ent Platform Deploy Role`) scoped to your subscription.
 - An **app registration + service principal** (`ent-platform-deploy`) that Ent authenticates as.
-- **Two keyless federated identity credentials** — no client secret is ever created:
-  - **GitHub Actions OIDC** — Ent's `ent-platform` deploy workflow.
-  - **EKS workload identity** — the Ent Home deploy job running in Ent's home-prod EKS cluster.
+- A **keyless federated identity credential** — no client secret is ever
+  created — trusting the **Ent Home deploy job** (EKS workload identity in
+  Ent's home-prod cluster). This is the only deploy path customer tenants
+  trust; no GitHub Actions or other CI trust is granted.
 - A **role assignment** binding the role to the service principal, gated by an ABAC condition that blocks privilege escalation (see [Permissions](#permissions)).
 - An **OpenSearch app registration + service principal** (`os_admin` / `os_reader` app roles).
+
+## Quota requirements
+
+Everything the capacity checks verify, scoped to the region you enter:
+
+| Check | Quota | Minimum free |
+|-------|-------|--------------|
+| Regional vCPUs | Total Regional vCPUs (`cores`) | 150 vCPUs |
+| AKS system node | Standard DSv3 Family (`Standard_D8s_v3`) | 8 vCPUs |
+| GPU — NVIDIA T4 | `standardNCASt4v3Family` | 20 vCPUs (5 cards × 4) |
+| GPU — NVIDIA A10 | `standardNVADSA10v5Family` | 108 vCPUs (3 cards × 36) |
+| GPU — NVIDIA A10 | `standardNCADSA10v4Family` | 96 vCPUs (3 cards × 32) |
+| Foundry — normal tier | GlobalStandard TPM for `gpt-5.1`, `gpt-5.2`, `gpt-4.1`, `gpt-5`, or `gpt-5-mini` | 250K TPM + model in regional catalog |
+| Foundry — fast tier | GlobalStandard TPM for `gpt-4.1-mini` or `gpt-5-nano` | 250K TPM + model in regional catalog |
+
+Only **one** of the three GPU families needs to pass: 5 full T4 cards (4 vLLM
+chat replicas + 1 TEI embeddings) or 3 full A10 cards (2 + 1). Fractional A10
+VM sizes (NV6/12/18ads, NC8/16ads) don't count toward cards. Likewise only
+**one** Foundry model per tier needs catalog presence + TPM headroom. TPM
+quota counts allocations held by *existing* deployments of the model in the
+subscription+region, even idle ones.
 
 ## Prerequisites
 
@@ -78,7 +92,7 @@ tenant (see [Prerequisites](#prerequisites)).
    quota checks** against your region (vCPUs, T4/A10 GPUs, Foundry model
    TPM + catalog with pinned versions — failures prompt before anything is
    created), and creates the custom role, the `ent-platform-deploy` app
-   registration + service principal, the two keyless federated credentials, the
+   registration + service principal, the keyless federated credential, the
    ABAC-gated role assignment, and the OpenSearch app. It is **idempotent** —
    safe to re-run; each step reconciles an existing object instead of failing.
 
@@ -124,8 +138,6 @@ federated credentials (see [Authentication](#authentication-no-client-secret)).
 | `-s`, `--subscription` | Target Azure subscription ID; prompted for interactively when omitted (Enter accepts your active az subscription). Required as a flag for non-interactive runs. | _(prompted)_ |
 | `--role-name` | Custom role display name | `Ent Platform Deploy Role` |
 | `--sp-name` | App registration / service principal display name | `ent-platform-deploy` |
-| `--github-repository` | GitHub repo (`owner/repo`) for the Actions OIDC credential | `ent-security/ent-platform` |
-| `--github-ref` | Git ref for the Actions credential | `refs/heads/main` |
 | `--env` | Ent home cluster the EKS credential trusts: `prod` or `dev`. `dev` provisions a separate `-dev` identity (see note). | `prod` |
 | `--eks-oidc-issuer` | Explicit EKS OIDC issuer URL (advanced; not combinable with `--env`) | _(resolved from `--env`)_ |
 | `--deploy-sa-subject` | Kubernetes service-account subject for the EKS credential | `system:serviceaccount:ent-home:ent-home-api` |
@@ -137,8 +149,8 @@ can't be derived from Azure and don't change what the script provisions; skipped
 values show `(not provided)` in the final block.
 
 The table shows `setup.sh` flags; `setup.ps1` takes the same options as PowerShell
-parameters — `-Subscription`, `-RoleName`, `-SpName`, `-GithubRepository`,
-`-GithubRef`, `-Env`, `-EksOidcIssuer`, `-DeploySaSubject`.
+parameters — `-Subscription`, `-RoleName`, `-SpName`, `-Env`, `-EksOidcIssuer`,
+`-DeploySaSubject`.
 
 For customer onboarding, **leave the EKS settings at their defaults** — every
 customer trusts Ent's home-**prod** cluster. `--env dev` exists only for
@@ -147,20 +159,23 @@ customer tenant; `--eks-oidc-issuer` is an escape hatch for any other cluster. T
 `--deploy-sa-subject` default is a frozen, fleet-wide contract pinned by Ent.
 
 `--env dev` provisions a **fully separate `ent-platform-deploy-dev` identity** — its
-own app registration, service principal, federated credentials, and OpenSearch app
+own app registration, service principal, federated credential, and OpenSearch app
 (`api://<tenant>/opensearch-dev`) — so internal dev testing never collides with the
 home/prod deploy app. Pass `--sp-name` to override the app name.
 
 ## Authentication (no client secret)
 
-The service principal is configured with **two federated identity credentials** —
-both keyless. No client secret is ever created or stored.
+The service principal has a single keyless **EKS workload identity** federated
+credential — the Ent Home deploy job (the Home application) running in Ent's
+home EKS cluster, which is how tenants are deployed. The issuer is selected by
+`--env` (default home-**prod**); the pod presents a projected service-account
+token (audience `api://AzureADTokenExchange`) and Microsoft Entra exchanges it
+for an ARM access token in your tenant. The issuer and the subject
+(`--deploy-sa-subject`) are **exact-match** values — frozen, fleet-wide
+contracts.
 
-1. **GitHub Actions OIDC** — issuer `https://token.actions.githubusercontent.com`, used by Ent's `ent-platform` deploy workflow. Scoped by `--github-repository` / `--github-ref`.
-2. **EKS workload identity** — issuer selected by `--env` (default home-**prod**), used by the Ent Home deploy job running in Ent's home EKS cluster. The pod presents a projected service-account token (audience `api://AzureADTokenExchange`); Microsoft Entra exchanges it for an ARM access token in your tenant. The issuer and the subject (`--deploy-sa-subject`) are **exact-match** values — frozen, fleet-wide contracts.
-
-Both credentials authenticate as the same service principal, so the two outputs
-you paste into Ent onboarding (`application_client_id`, `tenant_id`) cover both paths.
+No client secret is ever created or stored, and no GitHub Actions (or other CI)
+trust is granted — customer tenants trust only the Ent Home deploy path.
 
 ## Running individual steps
 
