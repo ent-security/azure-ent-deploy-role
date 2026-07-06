@@ -217,6 +217,7 @@ The custom role grants permissions to manage the following Azure services:
 | Monitoring | `Microsoft.Insights` | Read-only |
 | Log Analytics | `Microsoft.OperationalInsights` | Read-only |
 | Compute (GPU capacity) | `Microsoft.Compute` | Read-only (VM SKUs + regional usage/quota, for the GPU serving-profile capability check) |
+| Resource provider registration | All | Register-only (`*/register/action`) |
 
 ### Excluded permissions (privilege escalation prevention)
 

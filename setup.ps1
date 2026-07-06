@@ -481,6 +481,7 @@ try {
     "Microsoft.Authorization/roleAssignments/*",
     "Microsoft.Authorization/roleDefinitions/read",
     "Microsoft.Resources/subscriptions/providers/read",
+    "*/register/action",
     "Microsoft.Compute/skus/read",
     "Microsoft.Compute/locations/usages/read",
     "Microsoft.CognitiveServices/accounts/*",
