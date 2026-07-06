@@ -9,6 +9,18 @@ no Terraform/OpenTofu required. Two equivalent versions are provided:
 
 Both `setup.sh` and `setup.ps1` provision, idempotently:
 
+- **Capacity & quota checks** run first against your chosen region — regional
+  vCPU quota (≥ 150 free), DSv3-family quota for the static AKS system node
+  (`Standard_D8s_v3`), NVIDIA T4/A10 GPU vCPU quota sized per silicon for the
+  serving baseline — **5 full T4 cards** (4 vLLM chat replicas + 1 TEI
+  embeddings; ≥ 20 `NCASt4_v3` vCPUs) or **3 full A10 cards** (2 chat replicas
+  + 1 TEI, since A10's bf16/batch-32 profile needs fewer pods; ≥ 108
+  `NVADSA10v5` or ≥ 96 `NCADSA10v4` vCPUs); a failure lists the exact quota
+  families/SKUs to request — and Azure AI Foundry model availability + TPM
+  headroom for the pinned serving models `gpt-5.1@2025-11-13` (normal tier)
+  and `gpt-5-nano@2025-08-07` (fast tier). Any failure prompts before anything
+  is created. Note: TPM quota counts allocations held by *existing* deployments
+  of the model in the subscription+region, even idle ones.
 - A **custom role definition** (`Ent Platform Deploy Role`) scoped to your subscription.
 - An **app registration + service principal** (`ent-platform-deploy`) that Ent authenticates as.
 - **Two keyless federated identity credentials** — no client secret is ever created:
@@ -37,41 +49,68 @@ tenant (see [Prerequisites](#prerequisites)).
    az login
    ```
 
-2. **Run the setup script** against your target subscription:
+2. **Run the setup script:**
 
    ```bash
    # bash (macOS / Linux)
-   ./setup.sh --subscription <your-subscription-id>
+   ./setup.sh
    ```
 
    ```powershell
    # PowerShell 7+ (Windows / macOS / Linux)
-   ./setup.ps1 -Subscription <your-subscription-id>
+   ./setup.ps1
    ```
 
-   It registers the required resource providers and creates the custom role, the
-   `ent-platform-deploy` app registration + service principal, the two keyless
-   federated credentials, the ABAC-gated role assignment, and the OpenSearch app.
-   It is **idempotent** — safe to re-run; each step reconciles an existing object
-   instead of failing.
+   It walks you through everything up front:
 
-3. **Copy the two values it prints** when it finishes:
+   - **Subscription** — press Enter to accept your active az subscription, or
+     type another ID. (You can also pass `--subscription` / `-Subscription` up
+     front; that's required if you run the script non-interactively.)
+   - **Tenant details** — tenant name, region, SSO domains, and superuser emails,
+     which your Ent contact needs. Press Enter to skip any you don't have yet;
+     you can re-run the script to fill them in. (The region also drives the
+     capacity checks below — skipping it skips them.)
+   - **Confirmation** — a final `Proceed? [y/N]` before it changes anything.
+
+   It then registers the required resource providers, runs the **capacity &
+   quota checks** against your region (vCPUs, T4/A10 GPUs, Foundry model
+   TPM + catalog with pinned versions — failures prompt before anything is
+   created), and creates the custom role, the `ent-platform-deploy` app
+   registration + service principal, the two keyless federated credentials, the
+   ABAC-gated role assignment, and the OpenSearch app. It is **idempotent** —
+   safe to re-run; each step reconciles an existing object instead of failing.
+
+3. **Copy the block it prints** when it finishes:
 
    ```
    ✓ Setup complete.
 
-   Paste these two values into the Azure connection panel in Ent onboarding:
+   ================================================================================
 
-     application_client_id : 11111111-2222-3333-4444-555555555555
-     tenant_id             : 66666666-7777-8888-9999-000000000000
+   Give this information back to your Ent contact to finish setting up your tenant:
+
+     cloud provider   : AZURE
+     tenant name      : Acme Prod
+     region           : eastus
+     sso domains      : acme.com,acme.io
+     superusers       : admin@acme.com,sec@acme.com
+
+     cloud provider details (subscription / Entra tenant / app client):
+       subscriptionId : 00000000-0000-0000-0000-000000000000
+       tenantId       : 66666666-7777-8888-9999-000000000000
+       clientId       : 11111111-2222-3333-4444-555555555555
+
+   ================================================================================
    ```
 
-   (It also prints the subscription ID, service-principal object ID, role
-   definition, and OpenSearch IDs for reference.)
+   The top four values are the answers you gave in the walkthrough; anything you
+   skipped shows `(not provided)` (re-run the script to fill it in). The
+   subscription / Entra tenant / app client IDs are derived automatically. The
+   script also prints reference IDs (service-principal object ID, role definition,
+   OpenSearch) below the block.
 
-4. **In Ent**, open the Azure connection settings page, enter the
-   **`application_client_id`**, **`tenant_id`**, and your **Subscription ID**, then
-   click **Save & Test Connection**.
+4. **Send that block to your Ent contact.** They use it to finish provisioning
+   your tenant — you don't need to run anything else.
 
 No client secret is ever created or stored — Ent authenticates through the
 federated credentials (see [Authentication](#authentication-no-client-secret)).
@@ -80,7 +119,7 @@ federated credentials (see [Authentication](#authentication-no-client-secret)).
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-s`, `--subscription` | Target Azure subscription ID | _(required)_ |
+| `-s`, `--subscription` | Target Azure subscription ID; prompted for interactively when omitted (Enter accepts your active az subscription). Required as a flag for non-interactive runs. | _(prompted)_ |
 | `--role-name` | Custom role display name | `Ent Platform Deploy Role` |
 | `--sp-name` | App registration / service principal display name | `ent-platform-deploy` |
 | `--github-repository` | GitHub repo (`owner/repo`) for the Actions OIDC credential | `ent-security/ent-platform` |
@@ -88,6 +127,12 @@ federated credentials (see [Authentication](#authentication-no-client-secret)).
 | `--env` | Ent home cluster the EKS credential trusts: `prod` or `dev`. `dev` provisions a separate `-dev` identity (see note). | `prod` |
 | `--eks-oidc-issuer` | Explicit EKS OIDC issuer URL (advanced; not combinable with `--env`) | _(resolved from `--env`)_ |
 | `--deploy-sa-subject` | Kubernetes service-account subject for the EKS credential | `system:serviceaccount:ent-home:ent-home-api` |
+
+The **tenant details** for your Ent contact (tenant name, region, SSO domains,
+superusers) aren't flags — the script prompts for them interactively during the
+run (see [First-time setup](#first-time-setup)). They're customer choices that
+can't be derived from Azure and don't change what the script provisions; skipped
+values show `(not provided)` in the final block.
 
 The table shows `setup.sh` flags; `setup.ps1` takes the same options as PowerShell
 parameters — `-Subscription`, `-RoleName`, `-SpName`, `-GithubRepository`,

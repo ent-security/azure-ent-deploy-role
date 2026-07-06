@@ -10,18 +10,18 @@
   Idempotent: safe to re-run. Each step checks for the existing object before
   creating it, so a second run reconciles rather than erroring.
 
-  Creates:
+  Steps:
     1. Resource provider registrations
-    2. Custom role definition ("Ent Platform Deploy Role")
-    3. App registration + service principal ("ent-platform-deploy")
-    4. Two federated identity credentials — NO client secret is ever created:
-         - GitHub Actions OIDC (ent-platform deploy workflow)
-         - EKS workload identity (Ent Home deploy job; home-prod by default,
-           -Env dev for Ent-internal testing only)
-    5. Role assignment binding the role to the SP, gated by an ABAC condition
-       that blocks granting/removing Owner, User Access Administrator, and
-       Role Based Access Control Administrator (privilege-escalation guard).
-    6. OpenSearch app registration + service principal (os_admin / os_reader)
+    2. Capacity & quota checks — regional + DSv3 system-node vCPU quota, T4/A10
+       GPU quota (5 T4 or 3 A10 full cards), Foundry catalog + TPM for the
+       pinned tiers. Failures prompt before anything below is created.
+    3. Custom role definition ("Ent Platform Deploy Role")
+    4. App registration + service principal ("ent-platform-deploy")
+    5. Two keyless federated identity credentials — GitHub Actions OIDC + Ent
+       Home EKS workload identity (-Env dev is Ent-internal only)
+    6. Role assignment, ABAC-gated to block granting/removing Owner, User
+       Access Administrator, and RBAC Administrator (escalation guard)
+    7. OpenSearch app registration + service principal (os_admin / os_reader)
 
   Prerequisites:
     - PowerShell 7+
@@ -30,7 +30,13 @@
       registrations in the tenant (e.g. Owner + Application Administrator)
 
 .EXAMPLE
+  ./setup.ps1
+  # Walks you through the subscription (Enter accepts your active az login), the
+  # tenant details (name, region, SSO domains, superusers), and a final confirm.
+
+.EXAMPLE
   ./setup.ps1 -Subscription 00000000-0000-0000-0000-000000000000
+  # Skips the subscription prompt; still asks the tenant details + confirm.
 
 .EXAMPLE
   # Ent-internal dev testing (separate ent-platform-deploy-dev identity):
@@ -39,8 +45,9 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory, HelpMessage = 'Target Azure subscription ID')]
-    [string] $Subscription,
+    # Target Azure subscription ID. Prompted for when omitted (Enter accepts the
+    # active az subscription); required as a parameter for non-interactive runs.
+    [string] $Subscription = '',
 
     [string] $RoleName = 'Ent Platform Deploy Role',
     [string] $RoleDescription = 'Custom role that grants Ent permissions to deploy and manage infrastructure in this subscription',
@@ -52,15 +59,61 @@ param(
     [string] $DeploySaSubject = 'system:serviceaccount:ent-home:ent-home-api'
 )
 
+# ── Tenant details (prompted below; blank on non-interactive runs) ────────────
+$TenantName = ''
+$Region     = ''
+$SsoDomains = ''
+$Superusers = ''
+
 $ErrorActionPreference = 'Stop'
 # az calls are checked explicitly via $LASTEXITCODE; never let a native command
 # auto-throw, so the "expected failure" existence checks below behave predictably.
 $PSNativeCommandUseErrorActionPreference = $false
 
+# Bold-green Ent rune + "ENT" banner.
+$Logo = @'
+
+  ██    ██     ███████╗ ███╗   ██╗ ████████╗
+  ██  ██       ██╔════╝ ████╗  ██║ ╚══██╔══╝
+  ████  ██     █████╗   ██╔██╗ ██║    ██║
+  ██  ██       ██╔══╝   ██║╚██╗██║    ██║
+  ████         ███████╗ ██║ ╚████║    ██║
+  ██           ╚══════╝ ╚═╝  ╚═══╝    ╚═╝
+'@
+Write-Host $Logo -ForegroundColor Green
+Write-Host '  Ent Security — Azure deployment identity setup'
+
 # Known Ent home-cluster EKS OIDC issuers. Customer tenants ALWAYS trust prod;
 # dev is for Ent-internal testing only and must never be used for a customer.
 $ProdEksOidcIssuer = 'https://oidc.eks.us-west-1.amazonaws.com/id/98DF15409F88BD228838D6794CA04EAD'
 $DevEksOidcIssuer  = 'https://oidc.eks.us-west-1.amazonaws.com/id/B86CB0977AB2E6A4A50182E607F3B4D7'
+
+# ── Capacity-check contracts (mirror ent-home-api validation + AzureModelSpec) ─
+# Models are pinned name@version; a stale pin FAILs listing the region's versions.
+$MinVcpusAvailable    = 150             # regional vCPU floor for an Ent deployment
+$AksSystemVmSku       = 'Standard_D8s_v3'    # static AKS system pool SKU — ent-platform deploy/tofu/azure/platform/variables.tf (aks_vm_size)
+$AksSystemVmFamily    = 'standardDSv3Family' # quota family the system SKU draws from
+$AksSystemVmVcpus     = 8               # vCPUs one Standard_D8s_v3 system node needs
+$FoundrySku           = 'GlobalStandard' # serving-tier deployment SKU (its TPM quota pool is checked)
+$FoundryTierTpmK      = 250             # K TPM needed per tier (AzureModelSpec DEFAULT_CAPACITY)
+$FoundryNormalModel   = 'gpt-5.1'       # normal serving tier
+$FoundryNormalVersion = '2025-11-13'
+$FoundryFastModel     = 'gpt-5-nano'    # fast serving tier
+$FoundryFastVersion   = '2025-08-07'
+
+# Baseline GPU cards per silicon: T4 = 4 vLLM chat replicas + 1 TEI (the
+# decode-bound T4 tier needs many shallow pods); A10 = 2 + 1 (E4B-bf16 batch-32
+# profile — GpuProfile.A10_E4B_BF16 — matches 4 T4s). Sources: ent-platform
+# production-stack-models values.yaml + tei-embeddings chart.
+$GpuT4Cards  = 5
+$GpuA10Cards = 3
+# T4/A10 quota families; VcpusPerCard = cheapest FULL-card VM (fractional A10
+# SKUs don't count).
+$GpuFamilies = @(
+    @{ Label = 'GPU (T4 v3)';  Family = 'standardNCASt4v3Family';   Cards = $GpuT4Cards;  VcpusPerCard = 4;  Skus = 'NC4as_T4_v3 (4 vCPU, 1 T4), NC8as_T4_v3 (8), NC16as_T4_v3 (16), NC64as_T4_v3 (64, 4 T4)' }
+    @{ Label = 'GPU (A10 v5)'; Family = 'standardNVADSA10v5Family'; Cards = $GpuA10Cards; VcpusPerCard = 36; Skus = 'NV36ads_A10_v5 (36 vCPU, 1 A10; NV6/12/18ads are fractional cards), NV72ads_A10_v5 (72, 2 A10)' }
+    @{ Label = 'GPU (A10 v4)'; Family = 'standardNCADSA10v4Family'; Cards = $GpuA10Cards; VcpusPerCard = 32; Skus = 'NC32ads_A10_v4 (32 vCPU, 1 A10; NC8/16ads are fractional cards)' }
+)
 
 # Built-in roles the deploy SP must NOT be able to assign or remove (escalation paths).
 $ForbiddenRoleGuids = '8e3af657-a8ff-443c-a75c-2fe8c4bcb635, 18d7d88d-d35e-4fb5-a5c3-7773c20a72d9, f58310d9-a9f6-439a-9e8d-f62e7b41a168'
@@ -75,8 +128,7 @@ function Invoke-Az {
     return (($output -join "`n").Trim())
 }
 
-# Resolve the EKS OIDC issuer: an explicit -EksOidcIssuer wins; otherwise pick by
-# -Env. The two are mutually exclusive to avoid ambiguity.
+# An explicit -EksOidcIssuer wins; otherwise -Env picks. Mutually exclusive.
 if ($EksOidcIssuer -and $Env) {
     throw 'Pass either -Env or -EksOidcIssuer, not both.'
 }
@@ -96,9 +148,7 @@ if ($IsDev) {
     Write-Warning 'Trusting the Ent home-DEV EKS cluster — Ent-internal testing only; never a customer tenant.'
 }
 
-# Default the app/SP name. Dev gets a fully separate '-dev' identity (its own app
-# registration, service principal, federated credentials, and OpenSearch app) so
-# it never collides with the home/prod app. An explicit -SpName overrides this.
+# Dev gets a fully separate '-dev' identity so it never collides with home/prod.
 if (-not $SpName) {
     $SpName = 'ent-platform-deploy'
     if ($IsDev) { $SpName = "$SpName-dev" }
@@ -108,10 +158,57 @@ if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     throw 'The Azure CLI (az) is not on PATH. Install it and run "az login".'
 }
 
-# Quiet az's warning-level chatter via the config env var rather than the
-# --only-show-errors global flag (recent az rejects that flag before the command
-# group: `az --only-show-errors account set` -> "'set' is misspelled").
+# Quiet az warnings via env var — recent az rejects --only-show-errors when it
+# precedes the command group.
 $env:AZURE_CORE_ONLY_SHOW_ERRORS = 'true'
+
+# ── Setup walkthrough ─────────────────────────────────────────────────────────
+# Interactive only: piped runs skip prompts (-Subscription required; tenant
+# details stay blank).
+if (-not [Console]::IsInputRedirected) {
+    if (-not $Subscription) {
+        Write-Step 'Deployment target'
+        # Enter accepts the active az subscription.
+        $curSubId = ((& az account show --query id -o tsv 2>$null) | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) { $curSubId = '' }
+        if ($curSubId) {
+            $curSubName = ((& az account show --query name -o tsv 2>$null) | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { $curSubName = '' }
+            $answer = Read-Host "  Azure subscription ID [$curSubId — $curSubName]"
+            $Subscription = if ($answer) { $answer } else { $curSubId }
+        }
+        else {
+            $Subscription = Read-Host '  Azure subscription ID'
+        }
+    }
+
+    Write-Step 'Tenant details (your Ent contact needs these)'
+    Write-Host "  Answer a few questions — press Enter to skip any you don't have yet."
+    Write-Host ''
+    $TenantName = Read-Host '  Tenant name (e.g. Acme Prod)'
+    $Region     = Read-Host '  Azure region (e.g. eastus)'
+    $SsoDomains = Read-Host '  SSO domains, comma-separated (e.g. acme.com,acme.io)'
+    $Superusers = Read-Host '  Superuser emails, comma-separated (e.g. admin@acme.com)'
+}
+
+if (-not $Subscription) {
+    throw 'An Azure subscription ID is required — pass -Subscription <id> on non-interactive runs.'
+}
+
+# Confirm before mutating anything (interactive only; an explicit -Subscription
+# on a non-interactive run is the consent). Only y/Y proceeds — Enter aborts.
+if (-not [Console]::IsInputRedirected) {
+    $subLabel = $Subscription
+    $subName = ((& az account show --subscription $Subscription --query name -o tsv 2>$null) | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0 -and $subName) { $subLabel = "$Subscription — $subName" }
+    Write-Host ''
+    $confirm = Read-Host "Proceed with setup in subscription $subLabel? [y/N]"
+    if ($confirm -notmatch '^[Yy]$') {
+        Write-Host 'Aborted — nothing was changed.'
+        exit 1
+    }
+}
+
 $Scope = "/subscriptions/$Subscription"
 
 Invoke-Az account set --subscription $Subscription | Out-Null
@@ -133,7 +230,201 @@ try {
         Invoke-Az provider register --namespace $ns --subscription $Subscription | Out-Null
     }
 
-    # ── 2. Custom role definition ───────────────────────────────────────────────
+    # ── 2. Capacity & quota checks ───────────────────────────────────────────────
+    # Verify the region can host an Ent deployment before creating any permission:
+    # regional + DSv3 system-node vCPUs, T4/A10 GPU cards, Foundry catalog + TPM.
+    # Mirrors ent-home-api's AzureDeploymentValidationService but FAILs (onboarding
+    # gate) instead of warning; az read errors still degrade to WARN (fail-open).
+    $script:QuotaFails = 0
+    $script:QuotaWarns = 0
+    function Write-CheckResult {
+        # $Status PASS|WARN|FAIL|INFO; INFO never gates.
+        param([string] $Status, [string] $Label, [string] $Message)
+        $color = switch ($Status) { 'PASS' { 'Green' } 'WARN' { 'Yellow' } 'INFO' { 'Cyan' } default { 'Red' } }
+        if ($Status -eq 'WARN') { $script:QuotaWarns++ }
+        if ($Status -eq 'FAIL') { $script:QuotaFails++ }
+        Write-Host ("  {0,-4}  {1,-14} {2}" -f $Status, $Label, $Message) -ForegroundColor $color
+    }
+    function Write-CheckSection {
+        param([string] $Title)
+        $t = " $Title "
+        $width = 76
+        $pad = [Math]::Max(0, [int][Math]::Floor(($width - $t.Length) / 2))
+        $right = [Math]::Max(0, $width - $pad - $t.Length)
+        Write-Host ''
+        Write-Host ('  ' + ('=' * $pad) + $t + ('=' * $right))
+    }
+    function Test-ModelCapacity {
+        param([string] $Tier, [string] $Model, [string] $Version)
+        $target = "$Model@$Version"
+
+        # Regional catalog must offer the exact pinned version.
+        $versionsRaw = ((& az cognitiveservices model list -l $Region --query "[?model.name=='$Model'].model.version" -o tsv 2>$null) | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) { $versionsRaw = '' }
+        $versions = @($versionsRaw -split "\r?\n" | Where-Object { $_ } | Sort-Object -Unique)
+        $versionsCsv = $versions -join ', '
+        if ($versions.Count -eq 0) {
+            Write-CheckResult FAIL "model ($Tier)" "Needed: $target  Available: none  SKU: $Model (Foundry catalog, $Region)"
+        }
+        elseif ($versions -contains $Version) {
+            Write-CheckResult PASS "model ($Tier)" "Needed: $target  Available: $versionsCsv  SKU: $Model (Foundry catalog, $Region)"
+        }
+        else {
+            Write-CheckResult FAIL "model ($Tier)" "Needed: $target  Available: $versionsCsv  SKU: $Model (Foundry catalog, $Region)"
+        }
+
+        # TPM quota headroom in the deployment SKU's per-model pool.
+        $row = ((& az cognitiveservices usage list -l $Region --query "[?name.value=='OpenAI.$FoundrySku.$Model'] | [0].[currentValue,limit]" -o tsv 2>$null) | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $row) {
+            Write-CheckResult WARN "TPM ($Tier)" "Needed: ${FoundryTierTpmK}K TPM  Available: unknown (no $FoundrySku pool reported)  SKU: $target ($FoundrySku)"
+            return
+        }
+        $parts = $row -split "`t"
+        $cur = [int][double]$parts[0]
+        $lim = [int][double]$parts[1]
+        $avail = $lim - $cur
+        if ($avail -ge $FoundryTierTpmK) {
+            Write-CheckResult PASS "TPM ($Tier)" "Needed: ${FoundryTierTpmK}K TPM  Available: ${avail}K of ${lim}K  SKU: $target ($FoundrySku)"
+        }
+        else {
+            Write-CheckResult FAIL "TPM ($Tier)" "Needed: ${FoundryTierTpmK}K TPM  Available: ${avail}K of ${lim}K  SKU: $target ($FoundrySku)"
+            Write-Host "         (TPM quota is allocated to existing $Model deployments in this subscription+region even when idle — delete/scale them or request a limit increase)"
+        }
+    }
+
+    if (-not $Region) {
+        Write-Step 'Capacity & quota checks — skipped (no region provided in the walkthrough)'
+    }
+    else {
+        # Normalize ('East US' → eastus); reject unknown regions early.
+        $regionInput = $Region
+        $Region = ($Region -replace '\s', '').ToLowerInvariant()
+        Write-Step "Capacity & quota checks (region: $Region)"
+        $knownRegion = ((& az account list-locations --query "[?name=='$Region'] | [0].name" -o tsv 2>$null) | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) { $knownRegion = '' }
+        if (-not $knownRegion) {
+            Write-CheckResult FAIL 'region' "'$regionInput' is not a known Azure region (expected a name like eastus)"
+        }
+        else {
+            # The usage/catalog APIs need these providers Registered; step 1's
+            # registrations are async, so wait briefly.
+            foreach ($ns in 'Microsoft.Compute', 'Microsoft.CognitiveServices') {
+                for ($i = 0; $i -lt 45; $i++) {
+                    $state = ((& az provider show --namespace $ns --query registrationState -o tsv 2>$null) | Out-String).Trim()
+                    if ($state -eq 'Registered') { break }
+                    Write-Host "  waiting for provider registration: $ns ($state)…"
+                    Start-Sleep -Seconds 2
+                }
+            }
+
+            # One compute-usage listing feeds the General Compute and GPU sections.
+            $vmJson = & az vm list-usage --location $Region -o json 2>$null
+            $vmRows = if ($LASTEXITCODE -eq 0 -and $vmJson) { $vmJson | ConvertFrom-Json } else { $null }
+
+            Write-CheckSection 'General Compute quota'
+            if (-not $vmRows) {
+                Write-CheckResult WARN 'vCPU (region)' "Needed: $MinVcpusAvailable  Available: unknown (could not read compute usages)  SKU: Total Regional vCPUs (cores)"
+                Write-CheckResult WARN 'vCPU (system)' "Needed: $AksSystemVmVcpus  Available: unknown (could not read compute usages)  SKU: $AksSystemVmSku ($AksSystemVmFamily)"
+            }
+            else {
+                $cores = $vmRows | Where-Object { $_.name.value -eq 'cores' } | Select-Object -First 1
+                if (-not $cores) {
+                    Write-CheckResult WARN 'vCPU (region)' "Needed: $MinVcpusAvailable  Available: unknown (quota not reported)  SKU: Total Regional vCPUs (cores)"
+                }
+                else {
+                    $lim = [int]$cores.limit
+                    $avail = $lim - [int]$cores.currentValue
+                    if ($avail -ge $MinVcpusAvailable) {
+                        Write-CheckResult PASS 'vCPU (region)' "Needed: $MinVcpusAvailable  Available: $avail of $lim  SKU: Total Regional vCPUs (cores)"
+                    }
+                    else {
+                        Write-CheckResult FAIL 'vCPU (region)' "Needed: $MinVcpusAvailable  Available: $avail of $lim  SKU: Total Regional vCPUs (cores) — request an increase"
+                    }
+                }
+
+                # Static AKS system node (Standard_D8s_v3 — ent-platform aks_vm_size)
+                # draws from the DSv3 family pool, separate from the regional total.
+                $sys = $vmRows | Where-Object { $_.name.value -eq $AksSystemVmFamily } | Select-Object -First 1
+                if (-not $sys) {
+                    Write-CheckResult WARN 'vCPU (system)' "Needed: $AksSystemVmVcpus  Available: unknown (quota not reported)  SKU: $AksSystemVmSku ($AksSystemVmFamily)"
+                }
+                else {
+                    $lim = [int]$sys.limit
+                    $avail = $lim - [int]$sys.currentValue
+                    if ($avail -ge $AksSystemVmVcpus) {
+                        Write-CheckResult PASS 'vCPU (system)' "Needed: $AksSystemVmVcpus  Available: $avail of $lim  SKU: $AksSystemVmSku ($AksSystemVmFamily)"
+                    }
+                    else {
+                        Write-CheckResult FAIL 'vCPU (system)' "Needed: $AksSystemVmVcpus  Available: $avail of $lim  SKU: $AksSystemVmSku ($AksSystemVmFamily) — request a 'Standard DSv3 Family vCPUs' increase"
+                    }
+                }
+            }
+
+            Write-CheckSection 'GPU quota (only ONE family needs to pass)'
+            if (-not $vmRows) {
+                Write-CheckResult WARN 'GPU' "could not read compute usages for $Region — T4/A10 availability unknown"
+            }
+            else {
+                # At least one T4/A10 family must fit its baseline card count. Short
+                # families print INFO when another covers it, FAIL only when none does.
+                $gpuOk = $false
+                $gpuResults = @()
+                foreach ($spec in $GpuFamilies) {
+                    $minV = $spec.Cards * $spec.VcpusPerCard
+                    $row = $vmRows | Where-Object { $_.name.value -eq $spec.Family } | Select-Object -First 1
+                    if (-not $row) {
+                        $gpuResults += [pscustomobject]@{ Spec = $spec; MinV = $minV; Avail = $null; AvailStr = 'not offered' }
+                        continue
+                    }
+                    $avail = [int]$row.limit - [int]$row.currentValue
+                    $gpuResults += [pscustomobject]@{ Spec = $spec; MinV = $minV; Avail = $avail; AvailStr = "$avail of $([int]$row.limit)" }
+                    if ($avail -ge $minV) { $gpuOk = $true }
+                }
+                foreach ($res in $gpuResults) {
+                    $gpuMsg = "Needed: $($res.MinV) vCPUs ($($res.Spec.Cards) cards × $($res.Spec.VcpusPerCard) vCPU/card)  Available: $($res.AvailStr)  SKU: $($res.Spec.Family)"
+                    if ($null -ne $res.Avail -and $res.Avail -ge $res.MinV) {
+                        Write-CheckResult PASS $res.Spec.Label $gpuMsg
+                    }
+                    elseif ($gpuOk) {
+                        Write-CheckResult INFO $res.Spec.Label $gpuMsg
+                    }
+                    else {
+                        Write-CheckResult FAIL $res.Spec.Label $gpuMsg
+                    }
+                }
+                if (-not $gpuOk) {
+                    Write-Host "         The Ent serving baseline needs $GpuT4Cards full T4 cards (4 chat replicas + 1 embeddings) or $GpuA10Cards full A10 cards (2 chat replicas + 1 embeddings)."
+                    Write-Host '         Request a quota increase on one of these GPU families (Azure portal → Quotas → Compute):'
+                    foreach ($spec in $GpuFamilies) {
+                        Write-Host "           - $($spec.Family) ($($spec.Label)): >= $($spec.Cards * $spec.VcpusPerCard) vCPUs for $($spec.Cards) cards — $($spec.Skus)"
+                    }
+                }
+            }
+
+            Write-CheckSection 'Foundry quota'
+            Test-ModelCapacity -Tier 'normal' -Model $FoundryNormalModel -Version $FoundryNormalVersion
+            Test-ModelCapacity -Tier 'fast'   -Model $FoundryFastModel   -Version $FoundryFastVersion
+        }
+
+        if ($script:QuotaFails -gt 0) {
+            if (-not [Console]::IsInputRedirected) {
+                Write-Host ''
+                $cont = Read-Host "Capacity checks reported $($script:QuotaFails) failure(s). Continue with setup anyway? [y/N]"
+                if ($cont -notmatch '^[Yy]$') {
+                    Write-Host 'Aborted before creating the deploy role/identity — fix quota/region and re-run.'
+                    exit 1
+                }
+            }
+            else {
+                Write-Warning "capacity checks reported $($script:QuotaFails) failure(s); continuing (non-interactive run)."
+            }
+        }
+        elseif ($script:QuotaWarns -gt 0) {
+            Write-Host '  (warnings above are advisory — a value could not be verified; continuing)'
+        }
+    }
+
+    # ── 3. Custom role definition ───────────────────────────────────────────────
     Write-Step "Ensuring custom role definition: $RoleName"
     $roleJson = @"
 {
@@ -200,22 +491,16 @@ try {
     [System.IO.File]::WriteAllText($rolePath, $roleJson)
 
     if (Invoke-Az role definition list --name $RoleName --scope $Scope --query "[0].name" -o tsv) {
-        # Reconcile the existing role so a re-run picks up permission changes (new Actions) — otherwise a
-        # permission added to an already-onboarded subscription's role would never land. The role is
-        # scoped to this one subscription, so the update needs write only here. If it was manually
-        # broadened to other subscriptions you can't write to, the update can fail with
-        # LinkedAuthorizationFailed — warn and continue rather than abort; pass -RoleName to manage a
-        # separate single-subscription role instead.
-        # Call az directly (not Invoke-Az) so we can capture and surface az's actual error on failure
-        # instead of Invoke-Az's generic "az ... failed" message.
+        # Reconcile so re-runs pick up new Actions. A role manually broadened to
+        # other subscriptions can fail with LinkedAuthorizationFailed — warn and
+        # continue; -RoleName manages a separate single-subscription role instead.
+        # Raw az (not Invoke-Az) so the real error can be surfaced.
         $updateOutput = & az role definition update --role-definition "@$rolePath" 2>&1
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  updated existing role definition '$RoleName'"
         }
         else {
-            # Surface the real error rather than assuming a cause: the expected one is
-            # LinkedAuthorizationFailed on a role broadened to other subscriptions (fix: -RoleName), but a
-            # malformed role or auth failure lands here too and the operator needs the real message.
+            # Show az's real error — auth/malformed-role failures land here too.
             Write-Host "  WARNING: could not update role definition '$RoleName'; leaving it as-is. If this is a"
             Write-Host "           shared multi-subscription role you lack write on (LinkedAuthorizationFailed),"
             Write-Host "           re-run with -RoleName <name> for a separate single-subscription role. az error:"
@@ -227,7 +512,7 @@ try {
         Write-Host '  created role definition'
     }
 
-    # ── 3. App registration + service principal ─────────────────────────────────
+    # ── 4. App registration + service principal ─────────────────────────────────
     Write-Step "Ensuring app registration + service principal: $SpName"
     $entAppId = Invoke-Az ad app list --display-name $SpName --query "[0].appId" -o tsv
     if (-not $entAppId) {
@@ -249,11 +534,10 @@ try {
     }
     $entSpObjectId = Invoke-Az ad sp show --id $entAppId --query id -o tsv
 
-    # ── 4. Federated identity credentials (keyless) ─────────────────────────────
+    # ── 5. Federated identity credentials (keyless) ─────────────────────────────
     function EnsureFic {
         param([string] $Name, [string] $Issuer, [string] $Subject)
-        # Azure enforces uniqueness on issuer+subject (not name), so match that
-        # combo — an equivalent credential may already exist under a different name.
+        # Azure keys uniqueness on issuer+subject; match that combo (name may differ).
         $existing = Invoke-Az ad app federated-credential list --id $entAppObjectId `
             --query "[?issuer=='$Issuer' && subject=='$Subject'].name | [0]" -o tsv
         if ($existing) {
@@ -278,7 +562,7 @@ try {
     EnsureFic -Name 'ent-home-federated' -Issuer 'https://token.actions.githubusercontent.com' -Subject "repo:${GithubRepository}:ref:${GithubRef}"
     EnsureFic -Name 'ent-home-eks-federated' -Issuer $EksOidcIssuer -Subject $DeploySaSubject
 
-    # ── 5. Role assignment with ABAC privilege-escalation guard ─────────────────
+    # ── 6. Role assignment with ABAC privilege-escalation guard ─────────────────
     Write-Step 'Assigning role to the service principal (ABAC-gated)'
     $abacTemplate = @'
 ( ( !(ActionMatches{'Microsoft.Authorization/roleAssignments/write'}) ) OR ( @Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {__GUIDS__} ) ) AND ( ( !(ActionMatches{'Microsoft.Authorization/roleAssignments/delete'}) ) OR ( @Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {__GUIDS__} ) )
@@ -306,15 +590,14 @@ try {
         }
     }
 
-    # ── 6. OpenSearch app registration + service principal ──────────────────────
+    # ── 7. OpenSearch app registration + service principal ──────────────────────
     Write-Step "Ensuring OpenSearch app registration: $SpName-opensearch"
     # Dev gets its own identifier URI so its OpenSearch app stays isolated from home's.
     $osUri = "api://$TenantId/opensearch"
     if ($IsDev) { $osUri = "$osUri-dev" }
     $osAppId = Invoke-Az ad app list --display-name "$SpName-opensearch" --query "[0].appId" -o tsv
     if (-not $osAppId) {
-        # Fall back to the identifier URI (uniqueness-constrained): an equivalent
-        # OpenSearch app may already exist under a different display name.
+        # Fall back to the unique identifier URI (display name may differ).
         $osAppId = Invoke-Az ad app list --identifier-uri $osUri --query "[0].appId" -o tsv
     }
     if (-not $osAppId) {
@@ -362,23 +645,51 @@ try {
     # ── Outputs ─────────────────────────────────────────────────────────────────
     $roleDefId = Invoke-Az role definition list --name $RoleName --scope $Scope --query "[0].id" -o tsv
 
+    # Blank tenant details show "(not provided)" and are listed in a closing note.
+    $missing = @()
+    if (-not $TenantName) { $missing += 'tenant name' }
+    if (-not $Region)     { $missing += 'region' }
+    if (-not $SsoDomains) { $missing += 'sso domains' }
+    if (-not $Superusers) { $missing += 'superusers' }
+
+    $dispName       = if ($TenantName) { $TenantName } else { '(not provided)' }
+    $dispRegion     = if ($Region)     { $Region }     else { '(not provided)' }
+    $dispSso        = if ($SsoDomains) { $SsoDomains } else { '(not provided)' }
+    $dispSuperusers = if ($Superusers) { $Superusers } else { '(not provided)' }
+
+    $bar = '=' * 80
     Write-Host ''
     Write-Host '✓ Setup complete.' -ForegroundColor Green
     Write-Host ''
-    Write-Host 'Paste these two values into the Azure connection panel in Ent onboarding:'
+    Write-Host $bar
     Write-Host ''
-    Write-Host "  application_client_id : $entAppId"
-    Write-Host "  tenant_id             : $TenantId"
+    Write-Host 'Give this information back to your Ent contact to finish setting up your tenant:'
     Write-Host ''
-    Write-Host 'Other outputs (for reference):'
+    Write-Host "  cloud provider   : AZURE"
+    Write-Host "  tenant name      : $dispName"
+    Write-Host "  region           : $dispRegion"
+    Write-Host "  sso domains      : $dispSso"
+    Write-Host "  superusers       : $dispSuperusers"
     Write-Host ''
-    Write-Host "  subscription_id                        : $Subscription"
+    Write-Host "  cloud provider details (subscription / Entra tenant / app client):"
+    Write-Host "    subscriptionId : $Subscription"
+    Write-Host "    tenantId       : $TenantId"
+    Write-Host "    clientId       : $entAppId"
+    Write-Host ''
+    Write-Host $bar
+    Write-Host ''
+    Write-Host 'Reference (diagnostics):'
+    Write-Host ''
     Write-Host "  service_principal_object_id            : $entSpObjectId"
     Write-Host "  role_definition_name                   : $RoleName"
     Write-Host "  role_definition_id                     : $roleDefId"
     Write-Host "  opensearch_client_id                   : $osAppId"
     Write-Host "  opensearch_identifier_uri              : $osUri"
     Write-Host "  opensearch_service_principal_object_id : $osSpObjectId"
+
+    if ($missing.Count -gt 0) {
+        Write-Warning ("these details were not provided: {0}. Re-run the script to enter them, or send them to your Ent contact separately." -f ($missing -join ', '))
+    }
 }
 finally {
     Remove-Item -Recurse -Force -Path $workdir -ErrorAction SilentlyContinue
