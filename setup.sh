@@ -9,8 +9,8 @@
 # Steps:
 #   1. Resource provider registrations
 #   2. Capacity & quota checks — regional + DSv3 system-node vCPU quota, T4/A10
-#      GPU quota (5 T4 or 3 A10 full cards), Foundry catalog + TPM for the
-#      pinned tiers. Failures prompt before anything below is created.
+#      GPU quota (5 T4 or 3 A10 full cards), Foundry catalog + TPM (any one
+#      approved model per tier). Failures prompt before anything is created.
 #   3. Custom role definition ("Ent Platform Deploy Role")
 #   4. App registration + service principal ("ent-platform-deploy")
 #   5. Two keyless federated identity credentials — GitHub Actions OIDC + Ent
@@ -54,10 +54,11 @@ AKS_SYSTEM_VM_FAMILY="standardDSv3Family"  # quota family the system SKU draws f
 AKS_SYSTEM_VM_VCPUS=8               # vCPUs one Standard_D8s_v3 system node needs
 FOUNDRY_SKU="GlobalStandard"        # serving-tier deployment SKU (its TPM quota pool is checked)
 FOUNDRY_TIER_TPM_K=250              # K TPM needed per tier (AzureModelSpec DEFAULT_CAPACITY)
-FOUNDRY_NORMAL_MODEL="gpt-5.1"      # normal serving tier
-FOUNDRY_NORMAL_VERSION="2025-11-13"
-FOUNDRY_FAST_MODEL="gpt-5-nano"     # fast serving tier
-FOUNDRY_FAST_VERSION="2025-08-07"
+# Benchmark-approved serving models per tier ("model" or "model@version"; bare
+# names accept any catalog version — gpt-5.2's pin is TBD). Any ONE model per
+# tier needs catalog presence + TPM headroom.
+FOUNDRY_NORMAL_MODELS="gpt-5.1@2025-11-13 gpt-5.2 gpt-4.1@2025-04-14 gpt-5@2025-08-07 gpt-5-mini@2025-08-07"
+FOUNDRY_FAST_MODELS="gpt-4.1-mini@2025-04-14 gpt-5-nano@2025-08-07"
 
 # Baseline GPU cards per silicon: T4 = 4 vLLM chat replicas + 1 TEI (the
 # decode-bound T4 tier needs many shallow pods); A10 = 2 + 1 (E4B-bf16 batch-32
@@ -278,37 +279,61 @@ check_section() { # $1 title — bold ='s bar with the title embedded
   printf '\n  \033[1m%s%s%s\033[0m\n' "${bar:0:pad}" "$t" "${bar:0:$(( ${#bar} - pad - ${#t} ))}"
 }
 
-check_model_capacity() { # $1 tier (normal|fast), $2 model, $3 pinned version
-  local tier="$1" model="$2" version="$3" target versions versions_csv row cur lim avail
-  target="${model}@${version}"
+check_tier_models() { # $1 tier, $2 candidate list; one line per model, any ONE passing covers the tier
+  local tier="$1" candidates="$2"
+  local spec model version versions versions_csv cat_ok cat_str row cur lim avail tpm_ok tpm_str ok
+  local tier_ok=false results=()
 
-  # Regional catalog must offer the exact pinned version.
-  versions="$("${AZ[@]}" cognitiveservices model list -l "$TENANT_REGION" \
-      --query "[?model.name=='${model}'].model.version" -o tsv 2>/dev/null | sort -u || true)"
-  versions_csv="$(echo "$versions" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
-  if [[ -z "$versions" ]]; then
-    check_result FAIL "model (${tier})" "Needed: ${target}  Available: none  SKU: ${model} (Foundry catalog, ${TENANT_REGION})"
-  elif grep -qx "$version" <<<"$versions"; then
-    check_result PASS "model (${tier})" "Needed: ${target}  Available: ${versions_csv}  SKU: ${model} (Foundry catalog, ${TENANT_REGION})"
-  else
-    check_result FAIL "model (${tier})" "Needed: ${target}  Available: ${versions_csv}  SKU: ${model} (Foundry catalog, ${TENANT_REGION})"
-  fi
+  for spec in $candidates; do
+    model="${spec%%@*}"
+    version=""
+    if [[ "$spec" == *@* ]]; then version="${spec#*@}"; fi
 
-  # TPM quota headroom in the deployment SKU's per-model pool.
-  row="$("${AZ[@]}" cognitiveservices usage list -l "$TENANT_REGION" \
-      --query "[?name.value=='OpenAI.${FOUNDRY_SKU}.${model}'] | [0].[currentValue,limit]" -o tsv 2>/dev/null || true)"
-  if [[ -z "$row" ]]; then
-    check_result WARN "TPM (${tier})" "Needed: ${FOUNDRY_TIER_TPM_K}K TPM  Available: unknown (no ${FOUNDRY_SKU} pool reported)  SKU: ${target} (${FOUNDRY_SKU})"
-    return
-  fi
-  cur="$(cut -f1 <<<"$row")"; cur="${cur%%.*}"
-  lim="$(cut -f2 <<<"$row")"; lim="${lim%%.*}"
-  avail=$((lim - cur))
-  if [[ "$avail" -ge "$FOUNDRY_TIER_TPM_K" ]]; then
-    check_result PASS "TPM (${tier})" "Needed: ${FOUNDRY_TIER_TPM_K}K TPM  Available: ${avail}K of ${lim}K  SKU: ${target} (${FOUNDRY_SKU})"
-  else
-    check_result FAIL "TPM (${tier})" "Needed: ${FOUNDRY_TIER_TPM_K}K TPM  Available: ${avail}K of ${lim}K  SKU: ${target} (${FOUNDRY_SKU})"
-    echo "         (TPM quota is allocated to existing ${model} deployments in this subscription+region even when idle — delete/scale them or request a limit increase)"
+    # Catalog: pinned versions must match exactly; bare names accept any.
+    versions="$(awk -F'\t' -v m="$model" '$1 == m {print $2}' <<<"$FOUNDRY_CATALOG_TSV" | sort -u)"
+    versions_csv="$(echo "$versions" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+    cat_ok=false
+    if [[ -z "$versions" ]]; then
+      cat_str="not in catalog"
+    elif [[ -z "$version" ]] || grep -qx "$version" <<<"$versions"; then
+      cat_ok=true
+      cat_str="catalog: ${versions_csv}"
+    else
+      cat_str="catalog: ${versions_csv} (no ${version})"
+    fi
+
+    row="$(awk -F'\t' -v k="OpenAI.${FOUNDRY_SKU}.${model}" '$1 == k {print $2 "\t" $3; exit}' <<<"$FOUNDRY_USAGES_TSV")"
+    tpm_ok=false
+    if [[ -z "$row" ]]; then
+      tpm_str="TPM pool unreported"
+    else
+      cur="$(cut -f1 <<<"$row")"; cur="${cur%%.*}"
+      lim="$(cut -f2 <<<"$row")"; lim="${lim%%.*}"
+      avail=$((lim - cur))
+      tpm_str="${avail}K of ${lim}K TPM"
+      if [[ "$avail" -ge "$FOUNDRY_TIER_TPM_K" ]]; then tpm_ok=true; fi
+    fi
+
+    ok=false
+    if [[ "$cat_ok" == true && "$tpm_ok" == true ]]; then ok=true; tier_ok=true; fi
+    results+=("${ok}|${spec}|${model}|${cat_str}|${tpm_str}")
+  done
+
+  local res
+  for res in "${results[@]}"; do
+    IFS='|' read -r ok spec model cat_str tpm_str <<<"$res"
+    local msg="Needed: ${spec} + ${FOUNDRY_TIER_TPM_K}K TPM  Available: ${cat_str}; ${tpm_str}  SKU: OpenAI.${FOUNDRY_SKU}.${model}"
+    if [[ "$ok" == true ]]; then
+      check_result PASS "$tier" "$msg"
+    elif [[ "$tier_ok" == true ]]; then
+      check_result INFO "$tier" "$msg"
+    else
+      check_result FAIL "$tier" "$msg"
+    fi
+  done
+  if [[ "$tier_ok" != true ]]; then
+    echo "         No ${tier}-tier model has catalog + TPM headroom — request a TPM increase or use a region offering one of: ${candidates}"
+    echo "         (TPM quota counts existing deployments in this subscription+region even when idle)"
   fi
 }
 
@@ -417,9 +442,12 @@ else
       fi
     fi
 
-    check_section "Foundry quota"
-    check_model_capacity "normal" "$FOUNDRY_NORMAL_MODEL" "$FOUNDRY_NORMAL_VERSION"
-    check_model_capacity "fast"   "$FOUNDRY_FAST_MODEL"   "$FOUNDRY_FAST_VERSION"
+    check_section "Foundry quota (only ONE model per tier needs to pass)"
+    # One catalog + one usage listing serve every candidate below.
+    FOUNDRY_CATALOG_TSV="$("${AZ[@]}" cognitiveservices model list -l "$TENANT_REGION" --query "[].[model.name,model.version]" -o tsv 2>/dev/null || true)"
+    FOUNDRY_USAGES_TSV="$("${AZ[@]}" cognitiveservices usage list -l "$TENANT_REGION" --query "[].[name.value,currentValue,limit]" -o tsv 2>/dev/null || true)"
+    check_tier_models "normal" "$FOUNDRY_NORMAL_MODELS"
+    check_tier_models "fast"   "$FOUNDRY_FAST_MODELS"
   fi
 
   if [[ "$QUOTA_FAILS" -gt 0 ]]; then

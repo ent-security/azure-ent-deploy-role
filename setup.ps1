@@ -13,8 +13,8 @@
   Steps:
     1. Resource provider registrations
     2. Capacity & quota checks — regional + DSv3 system-node vCPU quota, T4/A10
-       GPU quota (5 T4 or 3 A10 full cards), Foundry catalog + TPM for the
-       pinned tiers. Failures prompt before anything below is created.
+       GPU quota (5 T4 or 3 A10 full cards), Foundry catalog + TPM (any one
+       approved model per tier). Failures prompt before anything is created.
     3. Custom role definition ("Ent Platform Deploy Role")
     4. App registration + service principal ("ent-platform-deploy")
     5. Two keyless federated identity credentials — GitHub Actions OIDC + Ent
@@ -96,10 +96,11 @@ $AksSystemVmFamily    = 'standardDSv3Family' # quota family the system SKU draws
 $AksSystemVmVcpus     = 8               # vCPUs one Standard_D8s_v3 system node needs
 $FoundrySku           = 'GlobalStandard' # serving-tier deployment SKU (its TPM quota pool is checked)
 $FoundryTierTpmK      = 250             # K TPM needed per tier (AzureModelSpec DEFAULT_CAPACITY)
-$FoundryNormalModel   = 'gpt-5.1'       # normal serving tier
-$FoundryNormalVersion = '2025-11-13'
-$FoundryFastModel     = 'gpt-5-nano'    # fast serving tier
-$FoundryFastVersion   = '2025-08-07'
+# Benchmark-approved serving models per tier ("model" or "model@version"; bare
+# names accept any catalog version — gpt-5.2's pin is TBD). Any ONE model per
+# tier needs catalog presence + TPM headroom.
+$FoundryNormalModels = @('gpt-5.1@2025-11-13', 'gpt-5.2', 'gpt-4.1@2025-04-14', 'gpt-5@2025-08-07', 'gpt-5-mini@2025-08-07')
+$FoundryFastModels   = @('gpt-4.1-mini@2025-04-14', 'gpt-5-nano@2025-08-07')
 
 # Baseline GPU cards per silicon: T4 = 4 vLLM chat replicas + 1 TEI (the
 # decode-bound T4 tier needs many shallow pods); A10 = 2 + 1 (E4B-bf16 batch-32
@@ -254,41 +255,56 @@ try {
         Write-Host ''
         Write-Host ('  ' + ('=' * $pad) + $t + ('=' * $right))
     }
-    function Test-ModelCapacity {
-        param([string] $Tier, [string] $Model, [string] $Version)
-        $target = "$Model@$Version"
+    function Test-TierModels {
+        # One line per candidate; any ONE passing (catalog + TPM) covers the tier.
+        param([string] $Tier, [string[]] $Candidates)
+        $tierOk = $false
+        $results = @()
 
-        # Regional catalog must offer the exact pinned version.
-        $versionsRaw = ((& az cognitiveservices model list -l $Region --query "[?model.name=='$Model'].model.version" -o tsv 2>$null) | Out-String).Trim()
-        if ($LASTEXITCODE -ne 0) { $versionsRaw = '' }
-        $versions = @($versionsRaw -split "\r?\n" | Where-Object { $_ } | Sort-Object -Unique)
-        $versionsCsv = $versions -join ', '
-        if ($versions.Count -eq 0) {
-            Write-CheckResult FAIL "model ($Tier)" "Needed: $target  Available: none  SKU: $Model (Foundry catalog, $Region)"
-        }
-        elseif ($versions -contains $Version) {
-            Write-CheckResult PASS "model ($Tier)" "Needed: $target  Available: $versionsCsv  SKU: $Model (Foundry catalog, $Region)"
-        }
-        else {
-            Write-CheckResult FAIL "model ($Tier)" "Needed: $target  Available: $versionsCsv  SKU: $Model (Foundry catalog, $Region)"
+        foreach ($spec in $Candidates) {
+            $model = $spec.Split('@')[0]
+            $version = if ($spec.Contains('@')) { $spec.Split('@', 2)[1] } else { '' }
+
+            # Catalog: pinned versions must match exactly; bare names accept any.
+            $versions = @($script:FoundryCatalog | Where-Object { $_.n -eq $model } | ForEach-Object { $_.v } | Sort-Object -Unique)
+            $catOk = $false
+            if ($versions.Count -eq 0) {
+                $catStr = 'not in catalog'
+            }
+            elseif (-not $version -or $versions -contains $version) {
+                $catOk = $true
+                $catStr = "catalog: $($versions -join ', ')"
+            }
+            else {
+                $catStr = "catalog: $($versions -join ', ') (no $version)"
+            }
+
+            $usage = $script:FoundryUsages | Where-Object { $_.name.value -eq "OpenAI.$FoundrySku.$model" } | Select-Object -First 1
+            $tpmOk = $false
+            if (-not $usage) {
+                $tpmStr = 'TPM pool unreported'
+            }
+            else {
+                $lim = [int][double]$usage.limit
+                $avail = $lim - [int][double]$usage.currentValue
+                $tpmStr = "${avail}K of ${lim}K TPM"
+                if ($avail -ge $FoundryTierTpmK) { $tpmOk = $true }
+            }
+
+            $ok = $catOk -and $tpmOk
+            if ($ok) { $tierOk = $true }
+            $results += [pscustomobject]@{ Ok = $ok; Spec = $spec; Model = $model; CatStr = $catStr; TpmStr = $tpmStr }
         }
 
-        # TPM quota headroom in the deployment SKU's per-model pool.
-        $row = ((& az cognitiveservices usage list -l $Region --query "[?name.value=='OpenAI.$FoundrySku.$Model'] | [0].[currentValue,limit]" -o tsv 2>$null) | Out-String).Trim()
-        if ($LASTEXITCODE -ne 0 -or -not $row) {
-            Write-CheckResult WARN "TPM ($Tier)" "Needed: ${FoundryTierTpmK}K TPM  Available: unknown (no $FoundrySku pool reported)  SKU: $target ($FoundrySku)"
-            return
+        foreach ($res in $results) {
+            $msg = "Needed: $($res.Spec) + ${FoundryTierTpmK}K TPM  Available: $($res.CatStr); $($res.TpmStr)  SKU: OpenAI.$FoundrySku.$($res.Model)"
+            if ($res.Ok) { Write-CheckResult PASS $Tier $msg }
+            elseif ($tierOk) { Write-CheckResult INFO $Tier $msg }
+            else { Write-CheckResult FAIL $Tier $msg }
         }
-        $parts = $row -split "`t"
-        $cur = [int][double]$parts[0]
-        $lim = [int][double]$parts[1]
-        $avail = $lim - $cur
-        if ($avail -ge $FoundryTierTpmK) {
-            Write-CheckResult PASS "TPM ($Tier)" "Needed: ${FoundryTierTpmK}K TPM  Available: ${avail}K of ${lim}K  SKU: $target ($FoundrySku)"
-        }
-        else {
-            Write-CheckResult FAIL "TPM ($Tier)" "Needed: ${FoundryTierTpmK}K TPM  Available: ${avail}K of ${lim}K  SKU: $target ($FoundrySku)"
-            Write-Host "         (TPM quota is allocated to existing $Model deployments in this subscription+region even when idle — delete/scale them or request a limit increase)"
+        if (-not $tierOk) {
+            Write-Host "         No $Tier-tier model has catalog + TPM headroom — request a TPM increase or use a region offering one of: $($Candidates -join ' ')"
+            Write-Host '         (TPM quota counts existing deployments in this subscription+region even when idle)'
         }
     }
 
@@ -401,9 +417,14 @@ try {
                 }
             }
 
-            Write-CheckSection 'Foundry quota'
-            Test-ModelCapacity -Tier 'normal' -Model $FoundryNormalModel -Version $FoundryNormalVersion
-            Test-ModelCapacity -Tier 'fast'   -Model $FoundryFastModel   -Version $FoundryFastVersion
+            Write-CheckSection 'Foundry quota (only ONE model per tier needs to pass)'
+            # One catalog + one usage listing serve every candidate below.
+            $catalogJson = & az cognitiveservices model list -l $Region --query "[].{n:model.name,v:model.version}" -o json 2>$null
+            $script:FoundryCatalog = if ($LASTEXITCODE -eq 0 -and $catalogJson) { $catalogJson | ConvertFrom-Json } else { @() }
+            $usagesJson = & az cognitiveservices usage list -l $Region -o json 2>$null
+            $script:FoundryUsages = if ($LASTEXITCODE -eq 0 -and $usagesJson) { $usagesJson | ConvertFrom-Json } else { @() }
+            Test-TierModels -Tier 'normal' -Candidates $FoundryNormalModels
+            Test-TierModels -Tier 'fast'   -Candidates $FoundryFastModels
         }
 
         if ($script:QuotaFails -gt 0) {

@@ -16,11 +16,13 @@ Both `setup.sh` and `setup.ps1` provision, idempotently:
   embeddings; ≥ 20 `NCASt4_v3` vCPUs) or **3 full A10 cards** (2 chat replicas
   + 1 TEI, since A10's bf16/batch-32 profile needs fewer pods; ≥ 108
   `NVADSA10v5` or ≥ 96 `NCADSA10v4` vCPUs); a failure lists the exact quota
-  families/SKUs to request — and Azure AI Foundry model availability + TPM
-  headroom for the pinned serving models `gpt-5.1@2025-11-13` (normal tier)
-  and `gpt-5-nano@2025-08-07` (fast tier). Any failure prompts before anything
-  is created. Note: TPM quota counts allocations held by *existing* deployments
-  of the model in the subscription+region, even idle ones.
+  families/SKUs to request — and Azure AI Foundry catalog availability + TPM
+  headroom for the benchmark-approved serving models, where any **one** model
+  per tier is enough: normal tier `gpt-5.1`, `gpt-5.2`, `gpt-4.1`, `gpt-5`, or
+  `gpt-5-mini`; fast tier `gpt-4.1-mini` or `gpt-5-nano` (pinned versions where
+  established). Any failure prompts before anything is created. Note: TPM quota
+  counts allocations held by *existing* deployments of the model in the
+  subscription+region, even idle ones.
 - A **custom role definition** (`Ent Platform Deploy Role`) scoped to your subscription.
 - An **app registration + service principal** (`ent-platform-deploy`) that Ent authenticates as.
 - **Two keyless federated identity credentials** — no client secret is ever created:
