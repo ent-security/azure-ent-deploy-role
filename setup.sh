@@ -53,11 +53,14 @@ AKS_SYSTEM_VM_FAMILY="standardDSv3Family"  # quota family the system SKU draws f
 AKS_SYSTEM_VM_VCPUS=8               # vCPUs one Standard_D8s_v3 system node needs
 FOUNDRY_SKU="GlobalStandard"        # serving-tier deployment SKU (its TPM quota pool is checked)
 FOUNDRY_TIER_TPM_K=250              # K TPM needed per tier (AzureModelSpec DEFAULT_CAPACITY)
-# Benchmark-approved serving models per tier ("model" or "model@version"; bare
-# names accept any catalog version — gpt-5.2's pin is TBD). Any ONE model per
-# tier needs catalog presence + TPM headroom.
+# Benchmark-approved serving models per tier, BEST FIRST ("model" or
+# "model@version"; bare names accept any catalog version — gpt-5.2's pin is
+# TBD). Any ONE model per tier needs catalog presence + TPM headroom; the best
+# passing one is recommended in the final handoff block.
 FOUNDRY_NORMAL_MODELS="gpt-5.1@2025-11-13 gpt-5.2 gpt-4.1@2025-04-14 gpt-5@2025-08-07 gpt-5-mini@2025-08-07"
 FOUNDRY_FAST_MODELS="gpt-4.1-mini@2025-04-14 gpt-5-nano@2025-08-07"
+FOUNDRY_NORMAL_PICK=""  # best passing model per tier — filled by the checks
+FOUNDRY_FAST_PICK=""
 
 # Baseline GPU cards per silicon: T4 = 4 vLLM chat replicas + 1 TEI (the
 # decode-bound T4 tier needs many shallow pods); A10 = 2 + 1 (E4B-bf16 batch-32
@@ -277,7 +280,7 @@ check_section() { # $1 title — bold ='s bar with the title embedded
 check_tier_models() { # $1 tier, $2 candidate list; one line per model, any ONE passing covers the tier
   local tier="$1" candidates="$2"
   local spec model version versions versions_csv cat_ok cat_str row cur lim avail tpm_ok tpm_str ok
-  local tier_ok=false results=()
+  local tier_ok=false tier_pick="" results=()
 
   for spec in $candidates; do
     model="${spec%%@*}"
@@ -310,7 +313,12 @@ check_tier_models() { # $1 tier, $2 candidate list; one line per model, any ONE 
     fi
 
     ok=false
-    if [[ "$cat_ok" == true && "$tpm_ok" == true ]]; then ok=true; tier_ok=true; fi
+    if [[ "$cat_ok" == true && "$tpm_ok" == true ]]; then
+      ok=true
+      tier_ok=true
+      # Candidates are listed best-first, so the first pass is the pick.
+      if [[ -z "$tier_pick" ]]; then tier_pick="$spec"; fi
+    fi
     results+=("${ok}|${spec}|${model}|${cat_str}|${tpm_str}")
   done
 
@@ -330,6 +338,7 @@ check_tier_models() { # $1 tier, $2 candidate list; one line per model, any ONE 
     echo "         No ${tier}-tier model has catalog + TPM headroom — request a TPM increase or use a region offering one of: ${candidates}"
     echo "         (TPM quota counts existing deployments in this subscription+region even when idle)"
   fi
+  if [[ "$tier" == "normal" ]]; then FOUNDRY_NORMAL_PICK="$tier_pick"; else FOUNDRY_FAST_PICK="$tier_pick"; fi
 }
 
 if [[ -z "$TENANT_REGION" ]]; then
@@ -702,6 +711,14 @@ disp_region="${TENANT_REGION:-(not provided)}"
 disp_sso="${SSO_DOMAINS:-(not provided)}"
 disp_superusers="${SUPERUSERS:-(not provided)}"
 
+if [[ -z "$TENANT_REGION" ]]; then
+  disp_foundry_normal="(not checked — no region provided)"
+  disp_foundry_fast="(not checked — no region provided)"
+else
+  disp_foundry_normal="${FOUNDRY_NORMAL_PICK:-(none passed — see capacity checks)}"
+  disp_foundry_fast="${FOUNDRY_FAST_PICK:-(none passed — see capacity checks)}"
+fi
+
 cat <<OUT
 
 $(printf '\033[1m✓ Setup complete.\033[0m')
@@ -715,6 +732,10 @@ Give this information back to your Ent contact to finish setting up your tenant:
   region           : ${disp_region}
   sso domains      : ${disp_sso}
   superusers       : ${disp_superusers}
+
+  foundry models (best passing per tier, from the capacity checks):
+    normal         : ${disp_foundry_normal}
+    fast           : ${disp_foundry_fast}
 
   cloud provider details (subscription / Entra tenant / app client):
     subscriptionId : ${SUBSCRIPTION_ID}
