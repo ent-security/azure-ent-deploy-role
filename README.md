@@ -111,6 +111,10 @@ tenant (see [Prerequisites](#prerequisites)).
      sso domains      : acme.com,acme.io
      superusers       : admin@acme.com,sec@acme.com
 
+     foundry models (best passing per tier, from the capacity checks):
+       normal         : gpt-5.1@2025-11-13
+       fast           : gpt-5-nano@2025-08-07
+
      cloud provider details (subscription / Entra tenant / app client):
        subscriptionId : 00000000-0000-0000-0000-000000000000
        tenantId       : 66666666-7777-8888-9999-000000000000
@@ -120,10 +124,12 @@ tenant (see [Prerequisites](#prerequisites)).
    ```
 
    The top four values are the answers you gave in the walkthrough; anything you
-   skipped shows `(not provided)` (re-run the script to fill it in). The
-   subscription / Entra tenant / app client IDs are derived automatically. The
-   script also prints reference IDs (service-principal object ID, role definition,
-   OpenSearch) below the block.
+   skipped shows `(not provided)` (re-run the script to fill it in). The foundry
+   models are the highest-preference benchmark-approved model per tier that
+   passed the capacity checks in your region, and the subscription / Entra
+   tenant / app client IDs are derived automatically. The script also prints
+   reference IDs (service-principal object ID, role definition, OpenSearch)
+   below the block.
 
 4. **Send that block to your Ent contact.** They use it to finish provisioning
    your tenant — you don't need to run anything else.

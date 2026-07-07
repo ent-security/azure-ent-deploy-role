@@ -95,11 +95,14 @@ $AksSystemVmFamily    = 'standardDSv3Family' # quota family the system SKU draws
 $AksSystemVmVcpus     = 8               # vCPUs one Standard_D8s_v3 system node needs
 $FoundrySku           = 'GlobalStandard' # serving-tier deployment SKU (its TPM quota pool is checked)
 $FoundryTierTpmK      = 250             # K TPM needed per tier (AzureModelSpec DEFAULT_CAPACITY)
-# Benchmark-approved serving models per tier ("model" or "model@version"; bare
-# names accept any catalog version — gpt-5.2's pin is TBD). Any ONE model per
-# tier needs catalog presence + TPM headroom.
+# Benchmark-approved serving models per tier, BEST FIRST ("model" or
+# "model@version"; bare names accept any catalog version — gpt-5.2's pin is
+# TBD). Any ONE model per tier needs catalog presence + TPM headroom; the best
+# passing one is recommended in the final handoff block.
 $FoundryNormalModels = @('gpt-5.1@2025-11-13', 'gpt-5.2', 'gpt-4.1@2025-04-14', 'gpt-5@2025-08-07', 'gpt-5-mini@2025-08-07')
 $FoundryFastModels   = @('gpt-4.1-mini@2025-04-14', 'gpt-5-nano@2025-08-07')
+$FoundryNormalPick   = ''  # best passing model per tier — filled by the checks
+$FoundryFastPick     = ''
 
 # Baseline GPU cards per silicon: T4 = 4 vLLM chat replicas + 1 TEI (the
 # decode-bound T4 tier needs many shallow pods); A10 = 2 + 1 (E4B-bf16 batch-32
@@ -258,6 +261,7 @@ try {
         # One line per candidate; any ONE passing (catalog + TPM) covers the tier.
         param([string] $Tier, [string[]] $Candidates)
         $tierOk = $false
+        $tierPick = ''
         $results = @()
 
         foreach ($spec in $Candidates) {
@@ -291,7 +295,11 @@ try {
             }
 
             $ok = $catOk -and $tpmOk
-            if ($ok) { $tierOk = $true }
+            if ($ok) {
+                $tierOk = $true
+                # Candidates are listed best-first, so the first pass is the pick.
+                if (-not $tierPick) { $tierPick = $spec }
+            }
             $results += [pscustomobject]@{ Ok = $ok; Spec = $spec; Model = $model; CatStr = $catStr; TpmStr = $tpmStr }
         }
 
@@ -305,6 +313,7 @@ try {
             Write-Host "         No $Tier-tier model has catalog + TPM headroom — request a TPM increase or use a region offering one of: $($Candidates -join ' ')"
             Write-Host '         (TPM quota counts existing deployments in this subscription+region even when idle)'
         }
+        if ($Tier -eq 'normal') { $script:FoundryNormalPick = $tierPick } else { $script:FoundryFastPick = $tierPick }
     }
 
     if (-not $Region) {
@@ -678,6 +687,15 @@ try {
     $dispSso        = if ($SsoDomains) { $SsoDomains } else { '(not provided)' }
     $dispSuperusers = if ($Superusers) { $Superusers } else { '(not provided)' }
 
+    if (-not $Region) {
+        $dispFoundryNormal = '(not checked — no region provided)'
+        $dispFoundryFast   = '(not checked — no region provided)'
+    }
+    else {
+        $dispFoundryNormal = if ($FoundryNormalPick) { $FoundryNormalPick } else { '(none passed — see capacity checks)' }
+        $dispFoundryFast   = if ($FoundryFastPick)   { $FoundryFastPick }   else { '(none passed — see capacity checks)' }
+    }
+
     $bar = '=' * 80
     Write-Host ''
     Write-Host '✓ Setup complete.' -ForegroundColor Green
@@ -691,6 +709,10 @@ try {
     Write-Host "  region           : $dispRegion"
     Write-Host "  sso domains      : $dispSso"
     Write-Host "  superusers       : $dispSuperusers"
+    Write-Host ''
+    Write-Host "  foundry models (best passing per tier, from the capacity checks):"
+    Write-Host "    normal         : $dispFoundryNormal"
+    Write-Host "    fast           : $dispFoundryFast"
     Write-Host ''
     Write-Host "  cloud provider details (subscription / Entra tenant / app client):"
     Write-Host "    subscriptionId : $Subscription"
