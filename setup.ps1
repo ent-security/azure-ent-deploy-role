@@ -117,6 +117,7 @@ $GpuFamilies = @(
     @{ Label = 'GPU (A10 v5)'; Family = 'standardNVADSA10v5Family'; Cards = $GpuA10Cards; VcpusPerCard = 36; Skus = 'NV36ads_A10_v5 (36 vCPU, 1 A10; NV6/12/18ads are fractional cards), NV72ads_A10_v5 (72, 2 A10)' }
     @{ Label = 'GPU (A10 v4)'; Family = 'standardNCADSA10v4Family'; Cards = $GpuA10Cards; VcpusPerCard = 32; Skus = 'NC32ads_A10_v4 (32 vCPU, 1 A10; NC8/16ads are fractional cards)' }
 )
+$GpuPassedSkus = @()    # quota families that passed — filled by the checks
 
 # Built-in roles the deploy SP must NOT be able to assign or remove (escalation paths).
 $ForbiddenRoleGuids = '8e3af657-a8ff-443c-a75c-2fe8c4bcb635, 18d7d88d-d35e-4fb5-a5c3-7773c20a72d9, f58310d9-a9f6-439a-9e8d-f62e7b41a168'
@@ -402,7 +403,10 @@ try {
                     }
                     $avail = [int]$row.limit - [int]$row.currentValue
                     $gpuResults += [pscustomobject]@{ Spec = $spec; MinV = $minV; Avail = $avail; AvailStr = "$avail of $([int]$row.limit)" }
-                    if ($avail -ge $minV) { $gpuOk = $true }
+                    if ($avail -ge $minV) {
+                        $gpuOk = $true
+                        $GpuPassedSkus += "$($spec.Family) $($spec.Label -replace '^GPU ', '')"
+                    }
                 }
                 foreach ($res in $gpuResults) {
                     $gpuMsg = "Needed: $($res.MinV) vCPUs ($($res.Spec.Cards) cards × $($res.Spec.VcpusPerCard) vCPU/card)  Available: $($res.AvailStr)  SKU: $($res.Spec.Family)"
@@ -688,10 +692,12 @@ try {
     $dispSuperusers = if ($Superusers) { $Superusers } else { '(not provided)' }
 
     if (-not $Region) {
+        $dispGpuSkus       = '(not checked — no region provided)'
         $dispFoundryNormal = '(not checked — no region provided)'
         $dispFoundryFast   = '(not checked — no region provided)'
     }
     else {
+        $dispGpuSkus       = if ($GpuPassedSkus.Count -gt 0) { $GpuPassedSkus -join ', ' } else { '(none passed — see capacity checks)' }
         $dispFoundryNormal = if ($FoundryNormalPick) { $FoundryNormalPick } else { '(none passed — see capacity checks)' }
         $dispFoundryFast   = if ($FoundryFastPick)   { $FoundryFastPick }   else { '(none passed — see capacity checks)' }
     }
@@ -710,9 +716,10 @@ try {
     Write-Host "  sso domains      : $dispSso"
     Write-Host "  superusers       : $dispSuperusers"
     Write-Host ''
-    Write-Host "  foundry models (best passing per tier, from the capacity checks):"
-    Write-Host "    normal         : $dispFoundryNormal"
-    Write-Host "    fast           : $dispFoundryFast"
+    Write-Host "  capacity check results:"
+    Write-Host "    gpu skus       : $dispGpuSkus"
+    Write-Host "    foundry normal : $dispFoundryNormal"
+    Write-Host "    foundry fast   : $dispFoundryFast"
     Write-Host ''
     Write-Host "  cloud provider details (subscription / Entra tenant / app client):"
     Write-Host "    subscriptionId : $Subscription"
