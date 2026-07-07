@@ -75,6 +75,7 @@ GPU_FAMILIES=(
   "GPU (A10 v5)|standardNVADSA10v5Family|${GPU_A10_CARDS}|36|NV36ads_A10_v5 (36 vCPU, 1 A10; NV6/12/18ads are fractional cards), NV72ads_A10_v5 (72, 2 A10)"
   "GPU (A10 v4)|standardNCADSA10v4Family|${GPU_A10_CARDS}|32|NC32ads_A10_v4 (32 vCPU, 1 A10; NC8/16ads are fractional cards)"
 )
+GPU_PASSED_SKUS=""      # quota families that passed — filled by the checks
 
 EKS_ENV=""            # --env prod|dev  (defaults to prod)
 EKS_OIDC_ISSUER=""    # explicit --eks-oidc-issuer override (advanced; not combinable with --env)
@@ -422,7 +423,10 @@ else
         lim="$(cut -f3 <<<"$row")"; lim="${lim%%.*}"
         avail=$((lim - cur))
         gpu_results+=("${glabel}|${cards}|${min_v}|${per_card}|${avail} of ${lim}|${fam}")
-        if [[ "$avail" -ge "$min_v" ]]; then gpu_ok=true; fi
+        if [[ "$avail" -ge "$min_v" ]]; then
+          gpu_ok=true
+          GPU_PASSED_SKUS+="${fam} ${glabel#GPU }, "
+        fi
       done
       for res in "${gpu_results[@]}"; do
         IFS='|' read -r glabel cards min_v per_card avail_str fam <<<"$res"
@@ -712,9 +716,12 @@ disp_sso="${SSO_DOMAINS:-(not provided)}"
 disp_superusers="${SUPERUSERS:-(not provided)}"
 
 if [[ -z "$TENANT_REGION" ]]; then
+  disp_gpu_skus="(not checked — no region provided)"
   disp_foundry_normal="(not checked — no region provided)"
   disp_foundry_fast="(not checked — no region provided)"
 else
+  disp_gpu_skus="${GPU_PASSED_SKUS%, }"
+  disp_gpu_skus="${disp_gpu_skus:-(none passed — see capacity checks)}"
   disp_foundry_normal="${FOUNDRY_NORMAL_PICK:-(none passed — see capacity checks)}"
   disp_foundry_fast="${FOUNDRY_FAST_PICK:-(none passed — see capacity checks)}"
 fi
@@ -733,9 +740,10 @@ Give this information back to your Ent contact to finish setting up your tenant:
   sso domains      : ${disp_sso}
   superusers       : ${disp_superusers}
 
-  foundry models (best passing per tier, from the capacity checks):
-    normal         : ${disp_foundry_normal}
-    fast           : ${disp_foundry_fast}
+  capacity check results:
+    gpu skus       : ${disp_gpu_skus}
+    foundry normal : ${disp_foundry_normal}
+    foundry fast   : ${disp_foundry_fast}
 
   cloud provider details (subscription / Entra tenant / app client):
     subscriptionId : ${SUBSCRIPTION_ID}
