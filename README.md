@@ -112,6 +112,9 @@ tenant (see [Prerequisites](#prerequisites)).
      superusers       : admin@acme.com,sec@acme.com
 
      capacity check results:
+       overall        : PASS — all quota checks passed
+       vcpu (region)  : PASS — 261 of 350 free (needs 150)
+       vcpu (system)  : PASS — 42 of 100 free (needs 8, Standard_D8s_v3)
        gpu skus       : standardNCASt4v3Family (T4 v3)
        foundry normal : gpt-5.1@2025-11-13
        foundry fast   : gpt-5-nano@2025-08-07
@@ -126,11 +129,13 @@ tenant (see [Prerequisites](#prerequisites)).
 
    The top four values are the answers you gave in the walkthrough; anything you
    skipped shows `(not provided)` (re-run the script to fill it in). The
-   capacity check results carry every GPU quota family that passed plus the
-   highest-preference benchmark-approved Foundry model per tier that passed in
-   your region, and the subscription / Entra tenant / app client IDs are
-   derived automatically. The script also prints reference IDs
-   (service-principal object ID, role definition, OpenSearch) below the block.
+   capacity check results carry the overall quota verdict (`overall: FAIL`
+   means the deployment is blocked until quota is raised), both vCPU statuses,
+   every GPU quota family that passed, and the highest-preference
+   benchmark-approved Foundry model per tier that passed in your region. The
+   subscription / Entra tenant / app client IDs are derived automatically, and
+   reference IDs (service-principal object ID, role definition, OpenSearch)
+   print below the block.
 
 4. **Send that block to your Ent contact.** They use it to finish provisioning
    your tenant — you don't need to run anything else.

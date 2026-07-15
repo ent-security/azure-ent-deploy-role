@@ -76,6 +76,8 @@ GPU_FAMILIES=(
   "GPU (A10 v4)|standardNCADSA10v4Family|${GPU_A10_CARDS}|32|NC32ads_A10_v4 (32 vCPU, 1 A10; NC8/16ads are fractional cards)"
 )
 GPU_PASSED_SKUS=""      # quota families that passed — filled by the checks
+VCPU_REGION_STATUS=""   # vCPU check summaries for the handoff block
+VCPU_SYSTEM_STATUS=""
 
 EKS_ENV=""            # --env prod|dev  (defaults to prod)
 EKS_OIDC_ISSUER=""    # explicit --eks-oidc-issuer override (advanced; not combinable with --env)
@@ -371,18 +373,23 @@ else
     if [[ -z "$vm_rows" ]]; then
       check_result WARN "vCPU (region)" "Needed: ${MIN_VCPUS_AVAILABLE}  Available: unknown (could not read compute usages)  SKU: Total Regional vCPUs (cores)"
       check_result WARN "vCPU (system)" "Needed: ${AKS_SYSTEM_VM_VCPUS}  Available: unknown (could not read compute usages)  SKU: ${AKS_SYSTEM_VM_SKU} (${AKS_SYSTEM_VM_FAMILY})"
+      VCPU_REGION_STATUS="WARN — could not read compute usages"
+      VCPU_SYSTEM_STATUS="WARN — could not read compute usages"
     else
       cores_row="$(grep $'^cores\t' <<<"$vm_rows" | head -n1 || true)"
       if [[ -z "$cores_row" ]]; then
         check_result WARN "vCPU (region)" "Needed: ${MIN_VCPUS_AVAILABLE}  Available: unknown (quota not reported)  SKU: Total Regional vCPUs (cores)"
+        VCPU_REGION_STATUS="WARN — quota not reported"
       else
         cur="$(cut -f2 <<<"$cores_row")"; cur="${cur%%.*}"
         lim="$(cut -f3 <<<"$cores_row")"; lim="${lim%%.*}"
         avail=$((lim - cur))
         if [[ "$avail" -ge "$MIN_VCPUS_AVAILABLE" ]]; then
           check_result PASS "vCPU (region)" "Needed: ${MIN_VCPUS_AVAILABLE}  Available: ${avail} of ${lim}  SKU: Total Regional vCPUs (cores)"
+          VCPU_REGION_STATUS="PASS — ${avail} of ${lim} free (needs ${MIN_VCPUS_AVAILABLE})"
         else
           check_result FAIL "vCPU (region)" "Needed: ${MIN_VCPUS_AVAILABLE}  Available: ${avail} of ${lim}  SKU: Total Regional vCPUs (cores) — request an increase"
+          VCPU_REGION_STATUS="FAIL — ${avail} of ${lim} free (needs ${MIN_VCPUS_AVAILABLE})"
         fi
       fi
 
@@ -391,14 +398,17 @@ else
       sys_row="$(grep -i "^${AKS_SYSTEM_VM_FAMILY}"$'\t' <<<"$vm_rows" | head -n1 || true)"
       if [[ -z "$sys_row" ]]; then
         check_result WARN "vCPU (system)" "Needed: ${AKS_SYSTEM_VM_VCPUS}  Available: unknown (quota not reported)  SKU: ${AKS_SYSTEM_VM_SKU} (${AKS_SYSTEM_VM_FAMILY})"
+        VCPU_SYSTEM_STATUS="WARN — quota not reported"
       else
         cur="$(cut -f2 <<<"$sys_row")"; cur="${cur%%.*}"
         lim="$(cut -f3 <<<"$sys_row")"; lim="${lim%%.*}"
         avail=$((lim - cur))
         if [[ "$avail" -ge "$AKS_SYSTEM_VM_VCPUS" ]]; then
           check_result PASS "vCPU (system)" "Needed: ${AKS_SYSTEM_VM_VCPUS}  Available: ${avail} of ${lim}  SKU: ${AKS_SYSTEM_VM_SKU} (${AKS_SYSTEM_VM_FAMILY})"
+          VCPU_SYSTEM_STATUS="PASS — ${avail} of ${lim} free (needs ${AKS_SYSTEM_VM_VCPUS}, ${AKS_SYSTEM_VM_SKU})"
         else
           check_result FAIL "vCPU (system)" "Needed: ${AKS_SYSTEM_VM_VCPUS}  Available: ${avail} of ${lim}  SKU: ${AKS_SYSTEM_VM_SKU} (${AKS_SYSTEM_VM_FAMILY}) — request a 'Standard DSv3 Family vCPUs' increase"
+          VCPU_SYSTEM_STATUS="FAIL — ${avail} of ${lim} free (needs ${AKS_SYSTEM_VM_VCPUS}, ${AKS_SYSTEM_VM_SKU})"
         fi
       fi
     fi
@@ -716,10 +726,22 @@ disp_sso="${SSO_DOMAINS:-(not provided)}"
 disp_superusers="${SUPERUSERS:-(not provided)}"
 
 if [[ -z "$TENANT_REGION" ]]; then
+  disp_quota_overall="(not checked — no region provided)"
+  disp_vcpu_region="(not checked — no region provided)"
+  disp_vcpu_system="(not checked — no region provided)"
   disp_gpu_skus="(not checked — no region provided)"
   disp_foundry_normal="(not checked — no region provided)"
   disp_foundry_fast="(not checked — no region provided)"
 else
+  if [[ "$QUOTA_FAILS" -gt 0 ]]; then
+    disp_quota_overall="FAIL — ${QUOTA_FAILS} blocking quota failure(s); deployment blocked until resolved"
+  elif [[ "$QUOTA_WARNS" -gt 0 ]]; then
+    disp_quota_overall="PASS — no blocking failures (${QUOTA_WARNS} advisory warning(s))"
+  else
+    disp_quota_overall="PASS — all quota checks passed"
+  fi
+  disp_vcpu_region="${VCPU_REGION_STATUS:-(not checked)}"
+  disp_vcpu_system="${VCPU_SYSTEM_STATUS:-(not checked)}"
   disp_gpu_skus="${GPU_PASSED_SKUS%, }"
   disp_gpu_skus="${disp_gpu_skus:-(none passed — see capacity checks)}"
   disp_foundry_normal="${FOUNDRY_NORMAL_PICK:-(none passed — see capacity checks)}"
@@ -741,6 +763,9 @@ Give this information back to your Ent contact to finish setting up your tenant:
   superusers       : ${disp_superusers}
 
   capacity check results:
+    overall        : ${disp_quota_overall}
+    vcpu (region)  : ${disp_vcpu_region}
+    vcpu (system)  : ${disp_vcpu_system}
     gpu skus       : ${disp_gpu_skus}
     foundry normal : ${disp_foundry_normal}
     foundry fast   : ${disp_foundry_fast}
