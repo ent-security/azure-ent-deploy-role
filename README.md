@@ -45,6 +45,11 @@ VM sizes (NV6/12/18ads, NC8/16ads) don't count toward cards. Likewise only
 quota counts allocations held by *existing* deployments of the model in the
 subscription+region, even idle ones.
 
+Short on any of these? Follow the step-by-step
+**[quota request guide](REQUESTINGQUOTA.md)** (with screenshots) to file the
+increase — GPU requests usually fail the instant self-serve path and need a
+support ticket, which can take 2–3 days.
+
 ## Prerequisites
 
 - **Azure CLI** `az` >= 2.37 (needs `az ad app federated-credential`), authenticated with `az login`.
@@ -244,8 +249,10 @@ Only role *definition* writes are blocked outright:
 
 ```
 azure-ent-deploy-role/
-├── setup.sh          # bash (macOS / Linux)
-├── setup.ps1         # PowerShell 7+
+├── setup.sh              # bash (macOS / Linux)
+├── setup.ps1             # PowerShell 7+
+├── REQUESTINGQUOTA.md    # step-by-step quota increase guide
+├── images/               # screenshots for the quota guide
 ├── .gitignore
 └── README.md
 ```
