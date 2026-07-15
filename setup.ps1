@@ -118,6 +118,8 @@ $GpuFamilies = @(
     @{ Label = 'GPU (A10 v4)'; Family = 'standardNCADSA10v4Family'; Cards = $GpuA10Cards; VcpusPerCard = 32; Skus = 'NC32ads_A10_v4 (32 vCPU, 1 A10; NC8/16ads are fractional cards)' }
 )
 $GpuPassedSkus = @()    # quota families that passed — filled by the checks
+$VcpuRegionStatus = ''  # vCPU check summaries for the handoff block
+$VcpuSystemStatus = ''
 
 # Built-in roles the deploy SP must NOT be able to assign or remove (escalation paths).
 $ForbiddenRoleGuids = '8e3af657-a8ff-443c-a75c-2fe8c4bcb635, 18d7d88d-d35e-4fb5-a5c3-7773c20a72d9, f58310d9-a9f6-439a-9e8d-f62e7b41a168'
@@ -350,20 +352,25 @@ try {
             if (-not $vmRows) {
                 Write-CheckResult WARN 'vCPU (region)' "Needed: $MinVcpusAvailable  Available: unknown (could not read compute usages)  SKU: Total Regional vCPUs (cores)"
                 Write-CheckResult WARN 'vCPU (system)' "Needed: $AksSystemVmVcpus  Available: unknown (could not read compute usages)  SKU: $AksSystemVmSku ($AksSystemVmFamily)"
+                $VcpuRegionStatus = 'WARN — could not read compute usages'
+                $VcpuSystemStatus = 'WARN — could not read compute usages'
             }
             else {
                 $cores = $vmRows | Where-Object { $_.name.value -eq 'cores' } | Select-Object -First 1
                 if (-not $cores) {
                     Write-CheckResult WARN 'vCPU (region)' "Needed: $MinVcpusAvailable  Available: unknown (quota not reported)  SKU: Total Regional vCPUs (cores)"
+                    $VcpuRegionStatus = 'WARN — quota not reported'
                 }
                 else {
                     $lim = [int]$cores.limit
                     $avail = $lim - [int]$cores.currentValue
                     if ($avail -ge $MinVcpusAvailable) {
                         Write-CheckResult PASS 'vCPU (region)' "Needed: $MinVcpusAvailable  Available: $avail of $lim  SKU: Total Regional vCPUs (cores)"
+                        $VcpuRegionStatus = "PASS — $avail of $lim free (needs $MinVcpusAvailable)"
                     }
                     else {
                         Write-CheckResult FAIL 'vCPU (region)' "Needed: $MinVcpusAvailable  Available: $avail of $lim  SKU: Total Regional vCPUs (cores) — request an increase"
+                        $VcpuRegionStatus = "FAIL — $avail of $lim free (needs $MinVcpusAvailable)"
                     }
                 }
 
@@ -372,15 +379,18 @@ try {
                 $sys = $vmRows | Where-Object { $_.name.value -eq $AksSystemVmFamily } | Select-Object -First 1
                 if (-not $sys) {
                     Write-CheckResult WARN 'vCPU (system)' "Needed: $AksSystemVmVcpus  Available: unknown (quota not reported)  SKU: $AksSystemVmSku ($AksSystemVmFamily)"
+                    $VcpuSystemStatus = 'WARN — quota not reported'
                 }
                 else {
                     $lim = [int]$sys.limit
                     $avail = $lim - [int]$sys.currentValue
                     if ($avail -ge $AksSystemVmVcpus) {
                         Write-CheckResult PASS 'vCPU (system)' "Needed: $AksSystemVmVcpus  Available: $avail of $lim  SKU: $AksSystemVmSku ($AksSystemVmFamily)"
+                        $VcpuSystemStatus = "PASS — $avail of $lim free (needs $AksSystemVmVcpus, $AksSystemVmSku)"
                     }
                     else {
                         Write-CheckResult FAIL 'vCPU (system)' "Needed: $AksSystemVmVcpus  Available: $avail of $lim  SKU: $AksSystemVmSku ($AksSystemVmFamily) — request a 'Standard DSv3 Family vCPUs' increase"
+                        $VcpuSystemStatus = "FAIL — $avail of $lim free (needs $AksSystemVmVcpus, $AksSystemVmSku)"
                     }
                 }
             }
@@ -692,11 +702,25 @@ try {
     $dispSuperusers = if ($Superusers) { $Superusers } else { '(not provided)' }
 
     if (-not $Region) {
+        $dispQuotaOverall  = '(not checked — no region provided)'
+        $dispVcpuRegion    = '(not checked — no region provided)'
+        $dispVcpuSystem    = '(not checked — no region provided)'
         $dispGpuSkus       = '(not checked — no region provided)'
         $dispFoundryNormal = '(not checked — no region provided)'
         $dispFoundryFast   = '(not checked — no region provided)'
     }
     else {
+        $dispQuotaOverall = if ($script:QuotaFails -gt 0) {
+            "FAIL — $($script:QuotaFails) blocking quota failure(s); deployment blocked until resolved"
+        }
+        elseif ($script:QuotaWarns -gt 0) {
+            "PASS — no blocking failures ($($script:QuotaWarns) advisory warning(s))"
+        }
+        else {
+            'PASS — all quota checks passed'
+        }
+        $dispVcpuRegion    = if ($VcpuRegionStatus) { $VcpuRegionStatus } else { '(not checked)' }
+        $dispVcpuSystem    = if ($VcpuSystemStatus) { $VcpuSystemStatus } else { '(not checked)' }
         $dispGpuSkus       = if ($GpuPassedSkus.Count -gt 0) { $GpuPassedSkus -join ', ' } else { '(none passed — see capacity checks)' }
         $dispFoundryNormal = if ($FoundryNormalPick) { $FoundryNormalPick } else { '(none passed — see capacity checks)' }
         $dispFoundryFast   = if ($FoundryFastPick)   { $FoundryFastPick }   else { '(none passed — see capacity checks)' }
@@ -717,6 +741,9 @@ try {
     Write-Host "  superusers       : $dispSuperusers"
     Write-Host ''
     Write-Host "  capacity check results:"
+    Write-Host "    overall        : $dispQuotaOverall"
+    Write-Host "    vcpu (region)  : $dispVcpuRegion"
+    Write-Host "    vcpu (system)  : $dispVcpuSystem"
     Write-Host "    gpu skus       : $dispGpuSkus"
     Write-Host "    foundry normal : $dispFoundryNormal"
     Write-Host "    foundry fast   : $dispFoundryFast"
