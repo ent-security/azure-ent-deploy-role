@@ -83,6 +83,7 @@ EKS_ENV=""            # --env prod|dev  (defaults to prod)
 EKS_OIDC_ISSUER=""    # explicit --eks-oidc-issuer override (advanced; not combinable with --env)
 
 SUBSCRIPTION_ID=""
+CHECK_READINESS=false
 
 # ── Tenant details (prompted below; blank on non-interactive runs) ────────────
 TENANT_NAME=""
@@ -92,6 +93,66 @@ SUPERUSERS=""
 
 # Built-in roles the deploy SP must NOT be able to assign or remove (escalation paths).
 readonly FORBIDDEN_ROLE_GUIDS="8e3af657-a8ff-443c-a75c-2fe8c4bcb635, 18d7d88d-d35e-4fb5-a5c3-7773c20a72d9, f58310d9-a9f6-439a-9e8d-f62e7b41a168"
+readonly REQUIRED_ACTIONS=(
+  "Microsoft.Resources/subscriptions/resourceGroups/read"
+  "Microsoft.Resources/subscriptions/resourceGroups/write"
+  "Microsoft.Resources/subscriptions/resourceGroups/delete"
+  "Microsoft.Resources/deployments/*"
+  "Microsoft.Network/virtualNetworks/*"
+  "Microsoft.Network/networkSecurityGroups/*"
+  "Microsoft.Network/natGateways/*"
+  "Microsoft.Network/publicIPAddresses/*"
+  "Microsoft.Network/privateEndpoints/*"
+  "Microsoft.Network/privateDnsZones/*"
+  "Microsoft.Network/applicationGateways/*"
+  "Microsoft.ContainerService/managedClusters/*"
+  "Microsoft.ContainerService/locations/*"
+  "Microsoft.ContainerRegistry/registries/*"
+  "Microsoft.ContainerRegistry/locations/*"
+  "Microsoft.DBforPostgreSQL/flexibleServers/*"
+  "Microsoft.DBforPostgreSQL/locations/*"
+  "Microsoft.Cache/redis/*"
+  "Microsoft.Cache/locations/*"
+  "Microsoft.KeyVault/vaults/*"
+  "Microsoft.KeyVault/locations/*"
+  "Microsoft.Storage/storageAccounts/*"
+  "Microsoft.Storage/locations/*"
+  "Microsoft.ServiceBus/namespaces/*"
+  "Microsoft.ServiceBus/locations/*"
+  "Microsoft.Network/dnszones/*"
+  "Microsoft.ManagedIdentity/userAssignedIdentities/*"
+  "Microsoft.Authorization/roleAssignments/*"
+  "Microsoft.Authorization/roleDefinitions/read"
+  "Microsoft.Resources/subscriptions/providers/read"
+  "*/register/action"
+  "Microsoft.Compute/skus/read"
+  "Microsoft.Compute/locations/usages/read"
+  "Microsoft.CognitiveServices/accounts/*"
+  "Microsoft.CognitiveServices/locations/*"
+  "Microsoft.CognitiveServices/deployments/*"
+  "Microsoft.Insights/*/read"
+  "Microsoft.OperationalInsights/*/read"
+  "Microsoft.Resources/tags/*"
+)
+readonly REQUIRED_NOT_ACTIONS=(
+  "Microsoft.Authorization/roleDefinitions/write"
+  "Microsoft.Authorization/roleDefinitions/delete"
+)
+readonly REQUIRED_DATA_ACTIONS=(
+  "Microsoft.KeyVault/vaults/secrets/*"
+  "Microsoft.KeyVault/vaults/certificates/*"
+  "Microsoft.KeyVault/vaults/keys/*"
+  "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/*"
+  "Microsoft.ServiceBus/namespaces/messages/*"
+  "Microsoft.CognitiveServices/accounts/OpenAI/*"
+  "Microsoft.CognitiveServices/accounts/deployments/*"
+)
+
+readonly TARGET_POLICY_NAME="Azure Kubernetes Service Private Clusters should be enabled"
+readonly TARGET_POLICY_ERROR_CODE="RequestDisallowedByPolicy"
+readonly TARGET_POLICY_DEFINITION_NAME="040732e8-d947-40b8-95d6-854c95024bf8"
+readonly TARGET_POLICY_DEFINITION_ID="/providers/Microsoft.Authorization/policyDefinitions/${TARGET_POLICY_DEFINITION_NAME}"
+readonly TARGET_POLICY_DEFAULT_EFFECT="Audit"
 
 usage() {
   cat <<'USAGE'
@@ -99,6 +160,7 @@ One-time manual setup for the Ent Security deployment identity (Azure CLI only).
 
 Usage:
   ./setup.sh [--subscription <subscription-id>] [overrides]
+  ./setup.sh --check-readiness [--subscription <subscription-id>] [overrides]
 
 Subscription:
   -s, --subscription <id>     Target Azure subscription ID. Prompted for when
@@ -108,6 +170,8 @@ Subscription:
 Overrides (frozen contracts — change only if you know why):
   --role-name <name>          Custom role display name.
   --sp-name <name>            App registration / service principal display name.
+  --check-readiness           Read-only validation that the selected or active
+                              subscription is ready for an Ent deployment.
   --env <prod|dev>            Ent home cluster the EKS credential trusts (default:
                               prod). 'dev' is Ent-internal only — never a customer.
   --eks-oidc-issuer <url>     Explicit EKS OIDC issuer URL (advanced; not
@@ -115,8 +179,10 @@ Overrides (frozen contracts — change only if you know why):
   --deploy-sa-subject <sub>   Kubernetes service-account subject for the EKS credential.
   -h, --help                  Show this help.
 
-The script then walks you through the subscription and your tenant details (name,
-region, SSO domains, superusers) and prints one block to hand back to your Ent contact.
+The normal setup path walks you through the subscription and your tenant details
+(name, region, SSO domains, superusers) and prints one block to hand back to
+your Ent contact. --check-readiness never mutates Azure resources; it checks the
+active subscription unless --subscription is provided.
 USAGE
   exit "${1:-0}"
 }
@@ -142,6 +208,8 @@ while [[ $# -gt 0 ]]; do
     -s|--subscription)         SUBSCRIPTION_ID="$2"; shift 2 ;;
     --role-name)               ROLE_NAME="$2"; shift 2 ;;
     --sp-name)                 SP_NAME="$2"; shift 2 ;;
+    --check-readiness|--readiness-check)
+                                CHECK_READINESS=true; shift ;;
     --env)                     EKS_ENV="$2"; shift 2 ;;
     --eks-oidc-issuer)         EKS_OIDC_ISSUER="$2"; shift 2 ;;
     --deploy-sa-subject)       DEPLOY_SA_SUBJECT="$2"; shift 2 ;;
@@ -192,6 +260,436 @@ export AZURE_CORE_ONLY_SHOW_ERRORS=true
 AZ=(az)
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+
+expected_abac_condition() {
+  cat <<COND
+(
+ (
+  !(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})
+ )
+ OR
+ (
+  @Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {${FORBIDDEN_ROLE_GUIDS}}
+ )
+)
+AND
+(
+ (
+  !(ActionMatches{'Microsoft.Authorization/roleAssignments/delete'})
+ )
+ OR
+ (
+  @Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {${FORBIDDEN_ROLE_GUIDS}}
+ )
+)
+COND
+}
+
+normalize_condition() {
+  tr -d '[:space:]'
+}
+
+READINESS_FAILS=0
+READINESS_WARNS=0
+REMEDIATION_ROWS=()
+POLICY_EXCEPTION_ROWS=()
+
+readiness_result() { # $1 PASS|WARN|FAIL, $2 label, $3 message
+  local color="32"
+  case "$1" in
+    WARN) color="33"; READINESS_WARNS=$((READINESS_WARNS + 1)) ;;
+    FAIL) color="31"; READINESS_FAILS=$((READINESS_FAILS + 1)) ;;
+  esac
+  printf '  \033[%sm%-4s\033[0m  %-18s %s\n' "$color" "$1" "$2" "$3"
+}
+
+add_remediation() { # $1 role entry/requirement, $2 service principal
+  REMEDIATION_ROWS+=("$1"$'\t'"$2")
+}
+
+add_policy_exception() { # $1 policy/deny assignment requirement
+  POLICY_EXCEPTION_ROWS+=("$1")
+}
+
+print_remediation() {
+  local row requirement principal
+  if [[ ${#REMEDIATION_ROWS[@]} -gt 0 ]]; then
+    printf '\n\033[1m==> Remediation\033[0m\n'
+    printf 'Please apply the following to the given service principal\n'
+    for row in "${REMEDIATION_ROWS[@]}"; do
+      IFS=$'\t' read -r requirement principal <<<"$row"
+      printf '  %s\t%s\n' "$requirement" "$principal"
+    done
+  fi
+  if [[ ${#POLICY_EXCEPTION_ROWS[@]} -gt 0 ]]; then
+    printf '\n\033[1m==> Policy Exceptions\033[0m\n'
+    printf 'Please seek a Policy exception for the following:\n'
+    for row in "${POLICY_EXCEPTION_ROWS[@]}"; do
+      printf '  %s\n' "$row"
+    done
+  fi
+}
+
+has_exact_line() { # $1 newline-delimited values, $2 expected exact value
+  local haystack="$1" needle="$2"
+  grep -Fxq "$needle" <<<"$haystack"
+}
+
+wildcard_covers_requirement() { # $1 actual wildcard pattern, $2 expected script entry
+  local actual_pattern="$1" expected="$2" prefix
+  if [[ "$actual_pattern" == "$expected" ]]; then
+    return 1
+  fi
+  if [[ "$actual_pattern" == "*" ]]; then
+    return 0
+  fi
+  if [[ "$actual_pattern" != *\* ]]; then
+    return 1
+  fi
+  prefix="${actual_pattern%\*}"
+  [[ "$expected" == "$prefix"* ]]
+}
+
+find_broad_covering_pattern() { # $1 newline-delimited actuals, $2 expected script entry
+  local actual="$1" expected="$2" actual_pattern
+  while IFS= read -r actual_pattern; do
+    [[ -z "$actual_pattern" ]] && continue
+    if wildcard_covers_requirement "$actual_pattern" "$expected"; then
+      printf '%s' "$actual_pattern"
+      return 0
+    fi
+  done <<<"$actual"
+  return 1
+}
+
+check_role_permission_set() { # $1 label, $2 newline-delimited actuals, remaining args expected values
+  local label="$1" actual="$2" expected cover missing=() covered=()
+  shift 2
+  for expected in "$@"; do
+    if has_exact_line "$actual" "$expected"; then
+      continue
+    fi
+    if cover="$(find_broad_covering_pattern "$actual" "$expected")"; then
+      covered+=("${expected} (via ${cover})")
+      add_remediation "${ROLE_NAME} ${label}: ${expected}" "$SP_NAME"
+    else
+      missing+=("$expected")
+      add_remediation "${ROLE_NAME} ${label}: ${expected}" "$SP_NAME"
+    fi
+  done
+  if [[ ${#covered[@]} -gt 0 ]]; then
+    readiness_result WARN "$label" "covered by broader wildcard but not exact script entries: ${covered[*]}. While the permission is granted, it does not match the initialization script. You may see unexpected errors."
+  fi
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    readiness_result FAIL "$label" "missing expected entries: ${missing[*]}"
+  elif [[ ${#covered[@]} -eq 0 ]]; then
+    readiness_result PASS "$label" "all expected entries are present"
+  fi
+}
+
+policy_id_matches_target() { # $1 policy definition id
+  local policy_id_l target_id_l target_name_l
+  policy_id_l="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  target_id_l="$(printf '%s' "$TARGET_POLICY_DEFINITION_ID" | tr '[:upper:]' '[:lower:]')"
+  target_name_l="$(printf '%s' "$TARGET_POLICY_DEFINITION_NAME" | tr '[:upper:]' '[:lower:]')"
+  [[ "$policy_id_l" == "$target_id_l" || "$policy_id_l" == *"/policydefinitions/${target_name_l}" ]]
+}
+
+assignment_param_value() { # $1 assignment id, $2 parameter name
+  "${AZ[@]}" rest \
+    --method get \
+    --url "https://management.azure.com${1}?api-version=2022-06-01" \
+    --query "properties.parameters.${2}.value" -o tsv 2>/dev/null || true
+}
+
+report_target_policy_effect() { # $1 effect, $2 assignment display, $3 assignment id
+  local effect="$1" assignment="$2" assignment_id="$3" effect_l
+  effect_l="$(printf '%s' "$effect" | tr '[:upper:]' '[:lower:]')"
+  case "$effect_l" in
+    ""|*\[*)
+      readiness_result WARN "policy" "could not resolve ${TARGET_POLICY_NAME} effect for '${assignment}'"
+      ;;
+    disabled)
+      readiness_result PASS "policy" "${TARGET_POLICY_NAME} is assigned but disabled in '${assignment}'"
+      ;;
+    audit|auditifnotexists|deployifnotexists|manual)
+      readiness_result PASS "policy" "${TARGET_POLICY_NAME} is assigned with non-blocking effect ${effect} in '${assignment}'"
+      ;;
+    deny|denyaction)
+      readiness_result FAIL "policy" "${TARGET_POLICY_ERROR_CODE}: ${TARGET_POLICY_NAME} is enforced with effect ${effect} by '${assignment}' (${assignment_id})"
+      add_policy_exception "${TARGET_POLICY_ERROR_CODE}: ${TARGET_POLICY_NAME} (${assignment_id})"
+      ;;
+    *)
+      readiness_result WARN "policy" "${TARGET_POLICY_NAME} has unrecognized effect '${effect}' in '${assignment}'"
+      ;;
+  esac
+}
+
+check_target_policy_assignment() { # $1 assignment id, $2 assignment display
+  local assignment_id="$1" display_name="$2" effect
+  effect="$(assignment_param_value "$assignment_id" "effect")"
+  effect="${effect:-$TARGET_POLICY_DEFAULT_EFFECT}"
+  report_target_policy_effect "$effect" "$display_name" "$assignment_id"
+  return 0
+}
+
+check_target_policy_set_assignment() { # $1 assignment id, $2 assignment display, $3 policy set definition id
+  local assignment_id="$1" display_name="$2" set_definition_id="$3"
+  local child_policy_id child_effect effect_param_re initiative_param assigned default effect
+
+  child_policy_id="$("${AZ[@]}" rest \
+    --method get \
+    --url "https://management.azure.com${set_definition_id}?api-version=2021-06-01" \
+    --query "properties.policyDefinitions[?contains(policyDefinitionId, '${TARGET_POLICY_DEFINITION_NAME}')].policyDefinitionId | [0]" -o tsv 2>/dev/null || true)"
+  if [[ -z "$child_policy_id" ]]; then
+    return 1
+  fi
+
+  child_effect="$("${AZ[@]}" rest \
+    --method get \
+    --url "https://management.azure.com${set_definition_id}?api-version=2021-06-01" \
+    --query "properties.policyDefinitions[?contains(policyDefinitionId, '${TARGET_POLICY_DEFINITION_NAME}')].parameters.effect.value | [0]" -o tsv 2>/dev/null || true)"
+  child_effect="${child_effect:-$TARGET_POLICY_DEFAULT_EFFECT}"
+
+  effect_param_re="\\[parameters\\([\\\"']?([^\\\"')]+)[\\\"']?\\)\\]"
+  if [[ "$child_effect" =~ $effect_param_re ]]; then
+    initiative_param="${BASH_REMATCH[1]}"
+    assigned="$(assignment_param_value "$assignment_id" "$initiative_param")"
+    default="$("${AZ[@]}" rest \
+      --method get \
+      --url "https://management.azure.com${set_definition_id}?api-version=2021-06-01" \
+      --query "properties.parameters.${initiative_param}.defaultValue" -o tsv 2>/dev/null || true)"
+    effect="${assigned:-${default:-$TARGET_POLICY_DEFAULT_EFFECT}}"
+  else
+    effect="$child_effect"
+  fi
+
+  report_target_policy_effect "$effect" "$display_name" "$assignment_id"
+  return 0
+}
+
+check_subscription_security_policies() {
+  local before_fails before_warns deny_count deny_rows policy_rows
+  local target_policy_seen=false
+  before_fails="$READINESS_FAILS"
+  before_warns="$READINESS_WARNS"
+
+  log "Checking subscription security policies"
+
+  if deny_count="$("${AZ[@]}" rest \
+      --method get \
+      --url "https://management.azure.com${SCOPE}/providers/Microsoft.Authorization/denyAssignments?api-version=2022-04-01&%24filter=atScope()" \
+      --query "length(value)" -o tsv 2>/dev/null)"; then
+    if [[ "${deny_count:-0}" -eq 0 ]]; then
+      readiness_result PASS "deny assignments" "none found at or above ${SCOPE}"
+    else
+      readiness_result FAIL "deny assignments" "${deny_count} deny assignment(s) found at or above ${SCOPE}"
+      deny_rows="$("${AZ[@]}" rest \
+        --method get \
+        --url "https://management.azure.com${SCOPE}/providers/Microsoft.Authorization/denyAssignments?api-version=2022-04-01&%24filter=atScope()" \
+        --query "value[0:5].[name,properties.scope,properties.isSystemProtected]" -o tsv 2>/dev/null || true)"
+      if [[ -n "$deny_rows" ]]; then
+        while IFS=$'\t' read -r name scope protected; do
+          [[ -z "$name" ]] && continue
+          printf '        - %s scope=%s systemProtected=%s\n' "$name" "$scope" "$protected"
+          add_policy_exception "Deny assignment: ${name} scope=${scope} systemProtected=${protected}"
+        done <<<"$deny_rows"
+      else
+        add_policy_exception "Deny assignments at or above ${SCOPE}"
+      fi
+    fi
+  else
+    readiness_result FAIL "deny assignments" "could not list deny assignments; cannot prove the subscription is unblocked"
+    add_policy_exception "Unable to verify deny assignments at or above ${SCOPE}"
+  fi
+
+  if ! policy_rows="$("${AZ[@]}" policy assignment list \
+      --scope "$SCOPE" \
+      --disable-scope-strict-match true \
+      --query "[].[id, displayName, enforcementMode, policyDefinitionId, policySetDefinitionId]" -o tsv 2>/dev/null)"; then
+    readiness_result FAIL "policy" "could not list Azure Policy assignments"
+    return
+  fi
+
+  while IFS=$'\t' read -r assignment_id display_name enforcement definition_id set_definition_id; do
+    [[ -z "$assignment_id" ]] && continue
+    if [[ "$(printf '%s' "${enforcement:-Default}" | tr '[:upper:]' '[:lower:]')" == "donotenforce" ]]; then
+      continue
+    fi
+    display_name="${display_name:-$(basename "$assignment_id")}"
+    if policy_id_matches_target "$definition_id"; then
+      target_policy_seen=true
+      check_target_policy_assignment "$assignment_id" "$display_name"
+    elif [[ -n "${set_definition_id:-}" || "$definition_id" == *"/policySetDefinitions/"* ]]; then
+      if check_target_policy_set_assignment "$assignment_id" "$display_name" "${set_definition_id:-$definition_id}"; then
+        target_policy_seen=true
+      fi
+    fi
+  done <<<"$policy_rows"
+
+  if [[ "$READINESS_FAILS" -eq "$before_fails" && "$READINESS_WARNS" -eq "$before_warns" ]]; then
+    if [[ "$target_policy_seen" == true ]]; then
+      readiness_result PASS "policy" "targeted Azure Policy '${TARGET_POLICY_NAME}' is not enforced with a blocking effect"
+    else
+      readiness_result PASS "policy" "targeted Azure Policy '${TARGET_POLICY_NAME}' is not assigned at or above ${SCOPE}"
+    fi
+  fi
+}
+
+run_readiness_check() {
+  local current_sub_id current_sub_name ent_app_id ent_app_object_id ent_sp_object_id fic_name
+  local role_def_id role_scopes role_actions role_not_actions role_data_actions role_assignment_id
+  local assignment_scope assignment_principal assignment_role assignment_condition assignment_condition_version
+  local expected_condition_norm actual_condition_norm missing=()
+
+  log "Readiness check (read-only)"
+
+  if [[ -z "$SUBSCRIPTION_ID" ]]; then
+    current_sub_id="$("${AZ[@]}" account show --query id -o tsv 2>/dev/null || true)"
+    current_sub_name="$("${AZ[@]}" account show --query name -o tsv 2>/dev/null || true)"
+    if [[ -z "$current_sub_id" ]]; then
+      readiness_result FAIL "subscription" "no active Azure login found; run 'az login'"
+    else
+      SUBSCRIPTION_ID="$current_sub_id"
+      readiness_result PASS "subscription" "using active subscription ${SUBSCRIPTION_ID}${current_sub_name:+ — ${current_sub_name}}"
+    fi
+  else
+    if "${AZ[@]}" account set --subscription "$SUBSCRIPTION_ID" >/dev/null 2>&1; then
+      SUBSCRIPTION_ID="$("${AZ[@]}" account show --query id -o tsv)"
+      current_sub_name="$("${AZ[@]}" account show --query name -o tsv 2>/dev/null || true)"
+      readiness_result PASS "subscription" "using ${SUBSCRIPTION_ID}${current_sub_name:+ — ${current_sub_name}}"
+    else
+      readiness_result FAIL "subscription" "could not select subscription ${SUBSCRIPTION_ID}"
+    fi
+  fi
+
+  if [[ "$READINESS_FAILS" -gt 0 ]]; then
+    echo
+    echo "Readiness check failed before Azure resource checks (${READINESS_FAILS} failure(s))."
+    exit 1
+  fi
+
+  SCOPE="/subscriptions/${SUBSCRIPTION_ID}"
+
+  log "Checking deployment identity"
+  ent_app_id="$("${AZ[@]}" ad app list --display-name "$SP_NAME" --query "[0].appId" -o tsv 2>/dev/null || true)"
+  if [[ -z "$ent_app_id" ]]; then
+    readiness_result FAIL "app registration" "missing app registration named '${SP_NAME}'"
+    add_remediation "App registration: ${SP_NAME}" "$SP_NAME"
+  else
+    readiness_result PASS "app registration" "found '${SP_NAME}' (${ent_app_id})"
+    ent_app_object_id="$("${AZ[@]}" ad app show --id "$ent_app_id" --query id -o tsv 2>/dev/null || true)"
+
+    if "${AZ[@]}" ad sp show --id "$ent_app_id" >/dev/null 2>&1; then
+      ent_sp_object_id="$("${AZ[@]}" ad sp show --id "$ent_app_id" --query id -o tsv)"
+      readiness_result PASS "service principal" "found service principal (${ent_sp_object_id})"
+    else
+      readiness_result FAIL "service principal" "missing service principal for app '${SP_NAME}' (${ent_app_id})"
+      add_remediation "Service principal for appId: ${ent_app_id}" "$SP_NAME"
+    fi
+
+    fic_name="$("${AZ[@]}" ad app federated-credential list \
+      --id "$ent_app_object_id" \
+      --query "[?issuer=='${EKS_OIDC_ISSUER}' && subject=='${DEPLOY_SA_SUBJECT}' && contains(audiences, 'api://AzureADTokenExchange')].name | [0]" -o tsv 2>/dev/null || true)"
+    if [[ -n "$fic_name" ]]; then
+      readiness_result PASS "federated cred" "found '${fic_name}' for EKS issuer and deploy service-account subject"
+    else
+      readiness_result FAIL "federated cred" "missing credential for issuer '${EKS_OIDC_ISSUER}' and subject '${DEPLOY_SA_SUBJECT}'"
+      add_remediation "Federated credential: issuer=${EKS_OIDC_ISSUER}, subject=${DEPLOY_SA_SUBJECT}, audience=api://AzureADTokenExchange" "$SP_NAME"
+    fi
+  fi
+
+  log "Checking custom role definition"
+  role_def_id="$("${AZ[@]}" role definition list --name "$ROLE_NAME" --scope "$SCOPE" --query "[0].id" -o tsv 2>/dev/null || true)"
+  if [[ -z "$role_def_id" ]]; then
+    readiness_result FAIL "role definition" "missing custom role '${ROLE_NAME}' at ${SCOPE}"
+    add_remediation "Role definition: ${ROLE_NAME} at ${SCOPE}" "$SP_NAME"
+  else
+    readiness_result PASS "role definition" "found '${ROLE_NAME}' (${role_def_id})"
+    role_scopes="$("${AZ[@]}" role definition list --name "$ROLE_NAME" --scope "$SCOPE" --query "[0].assignableScopes[]" -o tsv 2>/dev/null || true)"
+    if has_exact_line "$role_scopes" "$SCOPE"; then
+      readiness_result PASS "assignable scope" "role is assignable at ${SCOPE}"
+    else
+      readiness_result FAIL "assignable scope" "role assignableScopes does not include ${SCOPE}"
+      add_remediation "${ROLE_NAME} assignableScopes: ${SCOPE}" "$SP_NAME"
+    fi
+
+    role_actions="$("${AZ[@]}" role definition list --name "$ROLE_NAME" --scope "$SCOPE" --query "[0].permissions[0].actions[]" -o tsv 2>/dev/null || true)"
+    role_not_actions="$("${AZ[@]}" role definition list --name "$ROLE_NAME" --scope "$SCOPE" --query "[0].permissions[0].notActions[]" -o tsv 2>/dev/null || true)"
+    role_data_actions="$("${AZ[@]}" role definition list --name "$ROLE_NAME" --scope "$SCOPE" --query "[0].permissions[0].dataActions[]" -o tsv 2>/dev/null || true)"
+    check_role_permission_set "role actions" "$role_actions" "${REQUIRED_ACTIONS[@]}"
+    check_role_permission_set "not actions" "$role_not_actions" "${REQUIRED_NOT_ACTIONS[@]}"
+    check_role_permission_set "data actions" "$role_data_actions" "${REQUIRED_DATA_ACTIONS[@]}"
+  fi
+
+  log "Checking role assignment and ABAC condition"
+  if [[ -z "${ent_sp_object_id:-}" || -z "${role_def_id:-}" ]]; then
+    readiness_result FAIL "role assignment" "cannot check assignment until service principal and role definition exist"
+    add_remediation "Role assignment: ${ROLE_NAME} at ${SCOPE}" "$SP_NAME"
+  else
+    role_assignment_id="$("${AZ[@]}" role assignment list \
+      --assignee "$ent_sp_object_id" \
+      --role "$ROLE_NAME" \
+      --scope "$SCOPE" \
+      --query "[0].id" -o tsv 2>/dev/null || true)"
+    if [[ -z "$role_assignment_id" ]]; then
+      readiness_result FAIL "role assignment" "missing '${ROLE_NAME}' assignment for ${SP_NAME} at ${SCOPE}"
+      add_remediation "Role assignment: ${ROLE_NAME} at ${SCOPE}" "$SP_NAME"
+    else
+      assignment_scope="$("${AZ[@]}" role assignment list --assignee "$ent_sp_object_id" --role "$ROLE_NAME" --scope "$SCOPE" --query "[0].scope" -o tsv 2>/dev/null || true)"
+      assignment_principal="$("${AZ[@]}" role assignment list --assignee "$ent_sp_object_id" --role "$ROLE_NAME" --scope "$SCOPE" --query "[0].principalId" -o tsv 2>/dev/null || true)"
+      assignment_role="$("${AZ[@]}" role assignment list --assignee "$ent_sp_object_id" --role "$ROLE_NAME" --scope "$SCOPE" --query "[0].roleDefinitionId" -o tsv 2>/dev/null || true)"
+      assignment_condition="$("${AZ[@]}" role assignment list --assignee "$ent_sp_object_id" --role "$ROLE_NAME" --scope "$SCOPE" --query "[0].condition" -o tsv 2>/dev/null || true)"
+      assignment_condition_version="$("${AZ[@]}" role assignment list --assignee "$ent_sp_object_id" --role "$ROLE_NAME" --scope "$SCOPE" --query "[0].conditionVersion" -o tsv 2>/dev/null || true)"
+
+      [[ "$assignment_scope" == "$SCOPE" ]] || missing+=("scope")
+      [[ "$assignment_principal" == "$ent_sp_object_id" ]] || missing+=("principal")
+      [[ "$assignment_role" == "$role_def_id" ]] || missing+=("role definition")
+      if [[ ${#missing[@]} -eq 0 ]]; then
+        readiness_result PASS "role assignment" "assignment is bound to ${SP_NAME} at ${SCOPE}"
+      else
+        readiness_result FAIL "role assignment" "assignment has incorrect ${missing[*]}"
+        add_remediation "Role assignment: ${ROLE_NAME} at ${SCOPE}" "$SP_NAME"
+      fi
+
+      if [[ "$assignment_condition_version" == "2.0" ]]; then
+        readiness_result PASS "ABAC version" "conditionVersion is 2.0"
+      else
+        readiness_result FAIL "ABAC version" "conditionVersion is '${assignment_condition_version:-missing}', expected 2.0"
+        add_remediation "ABAC conditionVersion: 2.0 on ${ROLE_NAME} assignment" "$SP_NAME"
+      fi
+
+      expected_condition_norm="$(expected_abac_condition | normalize_condition)"
+      actual_condition_norm="$(printf '%s' "$assignment_condition" | normalize_condition)"
+      if [[ "$actual_condition_norm" == "$expected_condition_norm" ]]; then
+        readiness_result PASS "ABAC condition" "role assignment blocks Owner, User Access Administrator, and RBAC Administrator"
+      else
+        readiness_result FAIL "ABAC condition" "condition does not match Ent's expected privilege-escalation guard"
+        add_remediation "ABAC condition: block Owner/User Access Administrator/RBAC Administrator on ${ROLE_NAME} assignment" "$SP_NAME"
+      fi
+    fi
+  fi
+
+  check_subscription_security_policies
+
+  print_remediation
+
+  printf '\n'
+  if [[ "$READINESS_FAILS" -gt 0 ]]; then
+    printf '\033[1;31mReadiness check failed:\033[0m %s failure(s), %s warning(s). Do not start deployment until failures are resolved.\n' "$READINESS_FAILS" "$READINESS_WARNS"
+    exit 1
+  fi
+  if [[ "$READINESS_WARNS" -gt 0 ]]; then
+    printf '\033[1;33mReadiness check passed with warnings:\033[0m %s warning(s). Review warnings before deployment.\n' "$READINESS_WARNS"
+  else
+    printf '\033[1;32mReadiness check passed:\033[0m subscription %s is ready for Ent deployment.\n' "$SUBSCRIPTION_ID"
+  fi
+}
+
+if [[ "$CHECK_READINESS" == true ]]; then
+  run_readiness_check
+  exit 0
+fi
 
 # ── Setup walkthrough ─────────────────────────────────────────────────────────
 # TTY only: piped runs skip prompts (--subscription required; tenant details
@@ -614,28 +1112,7 @@ ensure_fic "ent-home-eks-federated" "$EKS_OIDC_ISSUER" "$DEPLOY_SA_SUBJECT"
 
 # ── 6. Role assignment with ABAC privilege-escalation guard ───────────────────
 log "Assigning role to the service principal (ABAC-gated)"
-ABAC_CONDITION="$(cat <<COND
-(
- (
-  !(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})
- )
- OR
- (
-  @Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {${FORBIDDEN_ROLE_GUIDS}}
- )
-)
-AND
-(
- (
-  !(ActionMatches{'Microsoft.Authorization/roleAssignments/delete'})
- )
- OR
- (
-  @Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {${FORBIDDEN_ROLE_GUIDS}}
- )
-)
-COND
-)"
+ABAC_CONDITION="$(expected_abac_condition)"
 
 if [[ -n "$("${AZ[@]}" role assignment list --assignee "$ENT_SP_OBJECT_ID" --role "$ROLE_NAME" --scope "$SCOPE" --query "[0].id" -o tsv 2>/dev/null)" ]]; then
   echo "  role assignment already present"

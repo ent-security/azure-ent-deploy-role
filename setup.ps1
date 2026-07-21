@@ -42,6 +42,10 @@
 .EXAMPLE
   # Ent-internal dev testing (separate ent-platform-deploy-dev identity):
   ./setup.ps1 -Subscription <dev-sub-id> -Env dev
+
+.EXAMPLE
+  ./setup.ps1 -CheckReadiness
+  # Read-only validation of the current az subscription before deployment.
 #>
 
 [CmdletBinding()]
@@ -53,6 +57,7 @@ param(
     [string] $RoleName = 'Ent Platform Deploy Role',
     [string] $RoleDescription = 'Custom role that grants Ent permissions to deploy and manage infrastructure in this subscription',
     [string] $SpName = '',            # default: ent-platform-deploy (suffixed -dev for -Env dev)
+    [switch] $CheckReadiness,         # read-only validation of the active/selected subscription
     [string] $Env = '',               # prod|dev (defaults to prod); not combinable with -EksOidcIssuer
     [string] $EksOidcIssuer = '',     # explicit issuer override (advanced)
     [string] $DeploySaSubject = 'system:serviceaccount:ent-home:ent-home-api'
@@ -123,6 +128,66 @@ $VcpuSystemStatus = ''
 
 # Built-in roles the deploy SP must NOT be able to assign or remove (escalation paths).
 $ForbiddenRoleGuids = '8e3af657-a8ff-443c-a75c-2fe8c4bcb635, 18d7d88d-d35e-4fb5-a5c3-7773c20a72d9, f58310d9-a9f6-439a-9e8d-f62e7b41a168'
+$RequiredActions = @(
+    'Microsoft.Resources/subscriptions/resourceGroups/read',
+    'Microsoft.Resources/subscriptions/resourceGroups/write',
+    'Microsoft.Resources/subscriptions/resourceGroups/delete',
+    'Microsoft.Resources/deployments/*',
+    'Microsoft.Network/virtualNetworks/*',
+    'Microsoft.Network/networkSecurityGroups/*',
+    'Microsoft.Network/natGateways/*',
+    'Microsoft.Network/publicIPAddresses/*',
+    'Microsoft.Network/privateEndpoints/*',
+    'Microsoft.Network/privateDnsZones/*',
+    'Microsoft.Network/applicationGateways/*',
+    'Microsoft.ContainerService/managedClusters/*',
+    'Microsoft.ContainerService/locations/*',
+    'Microsoft.ContainerRegistry/registries/*',
+    'Microsoft.ContainerRegistry/locations/*',
+    'Microsoft.DBforPostgreSQL/flexibleServers/*',
+    'Microsoft.DBforPostgreSQL/locations/*',
+    'Microsoft.Cache/redis/*',
+    'Microsoft.Cache/locations/*',
+    'Microsoft.KeyVault/vaults/*',
+    'Microsoft.KeyVault/locations/*',
+    'Microsoft.Storage/storageAccounts/*',
+    'Microsoft.Storage/locations/*',
+    'Microsoft.ServiceBus/namespaces/*',
+    'Microsoft.ServiceBus/locations/*',
+    'Microsoft.Network/dnszones/*',
+    'Microsoft.ManagedIdentity/userAssignedIdentities/*',
+    'Microsoft.Authorization/roleAssignments/*',
+    'Microsoft.Authorization/roleDefinitions/read',
+    'Microsoft.Resources/subscriptions/providers/read',
+    '*/register/action',
+    'Microsoft.Compute/skus/read',
+    'Microsoft.Compute/locations/usages/read',
+    'Microsoft.CognitiveServices/accounts/*',
+    'Microsoft.CognitiveServices/locations/*',
+    'Microsoft.CognitiveServices/deployments/*',
+    'Microsoft.Insights/*/read',
+    'Microsoft.OperationalInsights/*/read',
+    'Microsoft.Resources/tags/*'
+)
+$RequiredNotActions = @(
+    'Microsoft.Authorization/roleDefinitions/write',
+    'Microsoft.Authorization/roleDefinitions/delete'
+)
+$RequiredDataActions = @(
+    'Microsoft.KeyVault/vaults/secrets/*',
+    'Microsoft.KeyVault/vaults/certificates/*',
+    'Microsoft.KeyVault/vaults/keys/*',
+    'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/*',
+    'Microsoft.ServiceBus/namespaces/messages/*',
+    'Microsoft.CognitiveServices/accounts/OpenAI/*',
+    'Microsoft.CognitiveServices/accounts/deployments/*'
+)
+
+$TargetPolicyName = 'Azure Kubernetes Service Private Clusters should be enabled'
+$TargetPolicyErrorCode = 'RequestDisallowedByPolicy'
+$TargetPolicyDefinitionName = '040732e8-d947-40b8-95d6-854c95024bf8'
+$TargetPolicyDefinitionId = "/providers/Microsoft.Authorization/policyDefinitions/$TargetPolicyDefinitionName"
+$TargetPolicyDefaultEffect = 'Audit'
 
 function Write-Step { param([string] $Message) Write-Host "`n==> $Message" -ForegroundColor Cyan }
 
@@ -132,6 +197,432 @@ function Invoke-Az {
     if ($LASTEXITCODE -ne 0) { throw "az $($args -join ' ') failed (exit $LASTEXITCODE)" }
     if ($null -eq $output) { return '' }
     return (($output -join "`n").Trim())
+}
+
+function Get-ExpectedAbacCondition {
+@"
+(
+ (
+  !(ActionMatches{'Microsoft.Authorization/roleAssignments/write'})
+ )
+ OR
+ (
+  @Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {$ForbiddenRoleGuids}
+ )
+)
+AND
+(
+ (
+  !(ActionMatches{'Microsoft.Authorization/roleAssignments/delete'})
+ )
+ OR
+ (
+  @Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {$ForbiddenRoleGuids}
+ )
+)
+"@
+}
+
+function Normalize-Condition {
+    param([AllowNull()][string] $Condition)
+    if (-not $Condition) { return '' }
+    return ($Condition -replace '\s+', '')
+}
+
+$script:ReadinessFails = 0
+$script:ReadinessWarns = 0
+$script:Scope = ''
+$script:RemediationRows = @()
+$script:PolicyExceptionRows = @()
+
+function Write-ReadinessResult {
+    param([string] $Status, [string] $Label, [string] $Message)
+    $color = switch ($Status) { 'PASS' { 'Green' } 'WARN' { 'Yellow' } default { 'Red' } }
+    if ($Status -eq 'WARN') { $script:ReadinessWarns++ }
+    if ($Status -eq 'FAIL') { $script:ReadinessFails++ }
+    Write-Host ("  {0,-4}  {1,-18} {2}" -f $Status, $Label, $Message) -ForegroundColor $color
+}
+
+function Add-Remediation {
+    param([string] $Requirement, [string] $ServicePrincipal)
+    $script:RemediationRows += [pscustomobject]@{
+        Requirement = $Requirement
+        ServicePrincipal = $ServicePrincipal
+    }
+}
+
+function Add-PolicyException {
+    param([string] $Requirement)
+    $script:PolicyExceptionRows += $Requirement
+}
+
+function Write-Remediation {
+    if ($script:RemediationRows.Count -gt 0) {
+        Write-Host "`n==> Remediation" -ForegroundColor Cyan
+        Write-Host 'Please apply the following to the given service principal'
+        foreach ($row in $script:RemediationRows) {
+            Write-Host "  $($row.Requirement)`t$($row.ServicePrincipal)"
+        }
+    }
+    if ($script:PolicyExceptionRows.Count -gt 0) {
+        Write-Host "`n==> Policy Exceptions" -ForegroundColor Cyan
+        Write-Host 'Please seek a Policy exception for the following:'
+        foreach ($row in $script:PolicyExceptionRows) {
+            Write-Host "  $row"
+        }
+    }
+}
+
+function Test-RolePermissionSet {
+    param([string] $Label, [string[]] $Actual, [string[]] $Expected)
+
+    function Test-WildcardCoversRequirement {
+        param([AllowNull()][string] $ActualPattern, [string] $ExpectedEntry)
+        if (-not $ActualPattern -or $ActualPattern -ieq $ExpectedEntry) { return $false }
+        if ($ActualPattern -eq '*') { return $true }
+        if (-not $ActualPattern.EndsWith('*')) { return $false }
+        $prefix = $ActualPattern.Substring(0, $ActualPattern.Length - 1)
+        return $ExpectedEntry.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+    $missing = @()
+    $covered = @()
+    foreach ($entry in $Expected) {
+        if ($Actual -contains $entry) { continue }
+        $cover = $Actual | Where-Object { Test-WildcardCoversRequirement -ActualPattern $_ -ExpectedEntry $entry } | Select-Object -First 1
+        if ($cover) {
+            $covered += "$entry (via $cover)"
+            Add-Remediation -Requirement "$RoleName ${Label}: $entry" -ServicePrincipal $SpName
+        }
+        else {
+            $missing += $entry
+            Add-Remediation -Requirement "$RoleName ${Label}: $entry" -ServicePrincipal $SpName
+        }
+    }
+
+    if ($covered.Count -gt 0) {
+        Write-ReadinessResult WARN $Label "covered by broader wildcard but not exact script entries: $($covered -join ', '). While the permission is granted, it does not match the initialization script. You may see unexpected errors."
+    }
+    if ($missing.Count -gt 0) {
+        Write-ReadinessResult FAIL $Label "missing expected entries: $($missing -join ', ')"
+    }
+    elseif ($covered.Count -eq 0) {
+        Write-ReadinessResult PASS $Label 'all expected entries are present'
+    }
+}
+
+function Test-PolicyIdMatchesTarget {
+    param([AllowNull()][string] $PolicyDefinitionId)
+    if (-not $PolicyDefinitionId) { return $false }
+    return (
+        $PolicyDefinitionId.Equals($TargetPolicyDefinitionId, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $PolicyDefinitionId.EndsWith("/policyDefinitions/$TargetPolicyDefinitionName", [System.StringComparison]::OrdinalIgnoreCase)
+    )
+}
+
+function Get-AssignmentParameterValue {
+    param([string] $AssignmentId, [string] $ParameterName)
+    $assignmentJson = & az rest --method get --url "https://management.azure.com${AssignmentId}?api-version=2022-06-01" -o json 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $assignmentJson) { return '' }
+    $assignment = $assignmentJson | ConvertFrom-Json
+    if (-not $assignment.properties.parameters) { return '' }
+    $paramProperty = $assignment.properties.parameters.PSObject.Properties[$ParameterName]
+    if ($paramProperty -and $paramProperty.Value.PSObject.Properties['value']) {
+        return [string]$paramProperty.Value.value
+    }
+    return ''
+}
+
+function Report-TargetPolicyEffect {
+    param([string] $Effect, [string] $AssignmentDisplayName, [string] $AssignmentId)
+    $effectLower = if ($Effect) { $Effect.ToLowerInvariant() } else { '' }
+    switch ($effectLower) {
+        { $_ -eq '' -or $_.Contains('[') } {
+            Write-ReadinessResult WARN 'policy' "could not resolve $TargetPolicyName effect for '$AssignmentDisplayName'"
+            break
+        }
+        'disabled' {
+            Write-ReadinessResult PASS 'policy' "$TargetPolicyName is assigned but disabled in '$AssignmentDisplayName'"
+            break
+        }
+        { $_ -in @('audit', 'auditifnotexists', 'deployifnotexists', 'manual') } {
+            Write-ReadinessResult PASS 'policy' "$TargetPolicyName is assigned with non-blocking effect $Effect in '$AssignmentDisplayName'"
+            break
+        }
+        { $_ -in @('deny', 'denyaction') } {
+            Write-ReadinessResult FAIL 'policy' "${TargetPolicyErrorCode}: $TargetPolicyName is enforced with effect $Effect by '$AssignmentDisplayName' ($AssignmentId)"
+            Add-PolicyException -Requirement "${TargetPolicyErrorCode}: $TargetPolicyName ($AssignmentId)"
+            break
+        }
+        default {
+            Write-ReadinessResult WARN 'policy' "$TargetPolicyName has unrecognized effect '$Effect' in '$AssignmentDisplayName'"
+        }
+    }
+}
+
+function Test-TargetPolicyAssignment {
+    param([string] $AssignmentId, [string] $AssignmentDisplayName)
+    $effect = Get-AssignmentParameterValue -AssignmentId $AssignmentId -ParameterName 'effect'
+    if (-not $effect) { $effect = $TargetPolicyDefaultEffect }
+    Report-TargetPolicyEffect -Effect $effect -AssignmentDisplayName $AssignmentDisplayName -AssignmentId $AssignmentId
+    return $true
+}
+
+function Test-TargetPolicySetAssignment {
+    param([string] $AssignmentId, [string] $AssignmentDisplayName, [string] $PolicySetDefinitionId)
+    if (-not $PolicySetDefinitionId) { return $false }
+    $setJson = & az rest --method get --url "https://management.azure.com${PolicySetDefinitionId}?api-version=2021-06-01" -o json 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $setJson) {
+        Write-ReadinessResult WARN 'policy' "could not inspect initiative '$AssignmentDisplayName' for targeted policy"
+        return $false
+    }
+    $setDefinition = $setJson | ConvertFrom-Json
+    $policyDefinitions = @($setDefinition.properties.policyDefinitions)
+    $targetDefinition = $policyDefinitions | Where-Object {
+        [string]$_.policyDefinitionId -like "*$TargetPolicyDefinitionName"
+    } | Select-Object -First 1
+    if (-not $targetDefinition) { return $false }
+
+    $childEffect = $TargetPolicyDefaultEffect
+    $effectProperty = if ($targetDefinition.parameters -and $targetDefinition.parameters.effect) {
+        $targetDefinition.parameters.effect
+    } else { $null }
+    if ($effectProperty -and $effectProperty.PSObject.Properties['value']) {
+        $childEffect = [string]$effectProperty.value
+    }
+
+    if ($childEffect -match "^\[parameters\(['""]?([^'"")]+)['""]?\)\]$") {
+        $initiativeParameter = $Matches[1]
+        $assigned = Get-AssignmentParameterValue -AssignmentId $AssignmentId -ParameterName $initiativeParameter
+        $default = ''
+        if ($setDefinition.properties.parameters) {
+            $defaultProperty = $setDefinition.properties.parameters.PSObject.Properties[$initiativeParameter]
+            if ($defaultProperty -and $defaultProperty.Value.PSObject.Properties['defaultValue']) {
+                $default = [string]$defaultProperty.Value.defaultValue
+            }
+        }
+        $effect = if ($assigned) { $assigned } elseif ($default) { $default } else { $TargetPolicyDefaultEffect }
+    }
+    else {
+        $effect = $childEffect
+    }
+
+    Report-TargetPolicyEffect -Effect $effect -AssignmentDisplayName $AssignmentDisplayName -AssignmentId $AssignmentId
+    return $true
+}
+
+function Test-SubscriptionSecurityPolicies {
+    $beforeFails = $script:ReadinessFails
+    $beforeWarns = $script:ReadinessWarns
+    $targetPolicySeen = $false
+
+    Write-Step 'Checking subscription security policies'
+
+    $denyUrl = "https://management.azure.com$($script:Scope)/providers/Microsoft.Authorization/denyAssignments?api-version=2022-04-01&%24filter=atScope()"
+    $denyJson = & az rest --method get --url $denyUrl -o json 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $denyJson) {
+        Write-ReadinessResult FAIL 'deny assignments' 'could not list deny assignments; cannot prove the subscription is unblocked'
+        Add-PolicyException -Requirement "Unable to verify deny assignments at or above $($script:Scope)"
+    }
+    else {
+        $denies = @((($denyJson | ConvertFrom-Json).value))
+        if ($denies.Count -eq 0) {
+            Write-ReadinessResult PASS 'deny assignments' "none found at or above $($script:Scope)"
+        }
+        else {
+            Write-ReadinessResult FAIL 'deny assignments' "$($denies.Count) deny assignment(s) found at or above $($script:Scope)"
+            $denies | Select-Object -First 5 | ForEach-Object {
+                Write-Host "        - $($_.name) scope=$($_.properties.scope) systemProtected=$($_.properties.isSystemProtected)"
+                Add-PolicyException -Requirement "Deny assignment: $($_.name) scope=$($_.properties.scope) systemProtected=$($_.properties.isSystemProtected)"
+            }
+        }
+    }
+
+    $assignmentsJson = & az policy assignment list --scope $script:Scope --disable-scope-strict-match true -o json 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-ReadinessResult FAIL 'policy' 'could not list Azure Policy assignments'
+        return
+    }
+    $assignments = if ($assignmentsJson) { @($assignmentsJson | ConvertFrom-Json) } else { @() }
+    foreach ($assignment in $assignments) {
+        if ([string]$assignment.enforcementMode -eq 'DoNotEnforce') { continue }
+        $displayName = if ($assignment.displayName) { $assignment.displayName } else { Split-Path -Leaf $assignment.id }
+        if (Test-PolicyIdMatchesTarget -PolicyDefinitionId $assignment.policyDefinitionId) {
+            $targetPolicySeen = $true
+            Test-TargetPolicyAssignment -AssignmentId $assignment.id -AssignmentDisplayName $displayName | Out-Null
+        }
+        elseif ($assignment.policySetDefinitionId -or [string]$assignment.policyDefinitionId -match '/policySetDefinitions/') {
+            $policySetDefinitionId = if ($assignment.policySetDefinitionId) { $assignment.policySetDefinitionId } else { $assignment.policyDefinitionId }
+            if (Test-TargetPolicySetAssignment -AssignmentId $assignment.id -AssignmentDisplayName $displayName -PolicySetDefinitionId $policySetDefinitionId) {
+                $targetPolicySeen = $true
+            }
+        }
+    }
+
+    if ($script:ReadinessFails -eq $beforeFails -and $script:ReadinessWarns -eq $beforeWarns) {
+        if ($targetPolicySeen) {
+            Write-ReadinessResult PASS 'policy' "targeted Azure Policy '$TargetPolicyName' is not enforced with a blocking effect"
+        }
+        else {
+            Write-ReadinessResult PASS 'policy' "targeted Azure Policy '$TargetPolicyName' is not assigned at or above $($script:Scope)"
+        }
+    }
+}
+
+function Invoke-ReadinessCheck {
+    Write-Step 'Readiness check (read-only)'
+
+    if (-not $script:Subscription) {
+        $curSubId = ((& az account show --query id -o tsv 2>$null) | Out-String).Trim()
+        $curSubName = ((& az account show --query name -o tsv 2>$null) | Out-String).Trim()
+        if (-not $curSubId) {
+            Write-ReadinessResult FAIL 'subscription' "no active Azure login found; run 'az login'"
+        }
+        else {
+            $script:Subscription = $curSubId
+            $suffix = if ($curSubName) { " — $curSubName" } else { '' }
+            Write-ReadinessResult PASS 'subscription' "using active subscription $script:Subscription$suffix"
+        }
+    }
+    else {
+        & az account set --subscription $script:Subscription 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $script:Subscription = ((& az account show --query id -o tsv 2>$null) | Out-String).Trim()
+            $curSubName = ((& az account show --query name -o tsv 2>$null) | Out-String).Trim()
+            $suffix = if ($curSubName) { " — $curSubName" } else { '' }
+            Write-ReadinessResult PASS 'subscription' "using $script:Subscription$suffix"
+        }
+        else {
+            Write-ReadinessResult FAIL 'subscription' "could not select subscription $script:Subscription"
+        }
+    }
+
+    if ($script:ReadinessFails -gt 0) {
+        Write-Host ''
+        Write-Host "Readiness check failed before Azure resource checks ($($script:ReadinessFails) failure(s))."
+        exit 1
+    }
+
+    $script:Scope = "/subscriptions/$script:Subscription"
+
+    Write-Step 'Checking deployment identity'
+    $entAppId = Invoke-Az ad app list --display-name $SpName --query "[0].appId" -o tsv
+    if (-not $entAppId) {
+        Write-ReadinessResult FAIL 'app registration' "missing app registration named '$SpName'"
+        Add-Remediation -Requirement "App registration: $SpName" -ServicePrincipal $SpName
+    }
+    else {
+        Write-ReadinessResult PASS 'app registration' "found '$SpName' ($entAppId)"
+        $entAppObjectId = Invoke-Az ad app show --id $entAppId --query id -o tsv
+
+        $spJson = & az ad sp show --id $entAppId -o json 2>$null
+        if ($LASTEXITCODE -eq 0 -and $spJson) {
+            $entSpObjectId = ($spJson | ConvertFrom-Json).id
+            Write-ReadinessResult PASS 'service principal' "found service principal ($entSpObjectId)"
+        }
+        else {
+            Write-ReadinessResult FAIL 'service principal' "missing service principal for app '$SpName' ($entAppId)"
+            Add-Remediation -Requirement "Service principal for appId: $entAppId" -ServicePrincipal $SpName
+        }
+
+        $ficJson = & az ad app federated-credential list --id $entAppObjectId -o json 2>$null
+        $fics = if ($LASTEXITCODE -eq 0 -and $ficJson) { @($ficJson | ConvertFrom-Json) } else { @() }
+        $fic = $fics | Where-Object {
+            $_.issuer -eq $EksOidcIssuer -and
+            $_.subject -eq $DeploySaSubject -and
+            @($_.audiences) -contains 'api://AzureADTokenExchange'
+        } | Select-Object -First 1
+        if ($fic) {
+            Write-ReadinessResult PASS 'federated cred' "found '$($fic.name)' for EKS issuer and deploy service-account subject"
+        }
+        else {
+            Write-ReadinessResult FAIL 'federated cred' "missing credential for issuer '$EksOidcIssuer' and subject '$DeploySaSubject'"
+            Add-Remediation -Requirement "Federated credential: issuer=$EksOidcIssuer, subject=$DeploySaSubject, audience=api://AzureADTokenExchange" -ServicePrincipal $SpName
+        }
+    }
+
+    Write-Step 'Checking custom role definition'
+    $roleJson = & az role definition list --name $RoleName --scope $script:Scope -o json 2>$null
+    $role = if ($LASTEXITCODE -eq 0 -and $roleJson) { @($roleJson | ConvertFrom-Json) | Select-Object -First 1 } else { $null }
+    if (-not $role) {
+        Write-ReadinessResult FAIL 'role definition' "missing custom role '$RoleName' at $($script:Scope)"
+        Add-Remediation -Requirement "Role definition: $RoleName at $($script:Scope)" -ServicePrincipal $SpName
+    }
+    else {
+        $roleDefId = $role.id
+        Write-ReadinessResult PASS 'role definition' "found '$RoleName' ($roleDefId)"
+        if (@($role.assignableScopes) -contains $script:Scope) {
+            Write-ReadinessResult PASS 'assignable scope' "role is assignable at $($script:Scope)"
+        }
+        else {
+            Write-ReadinessResult FAIL 'assignable scope' "role assignableScopes does not include $($script:Scope)"
+            Add-Remediation -Requirement "$RoleName assignableScopes: $($script:Scope)" -ServicePrincipal $SpName
+        }
+        $roleActions = @($role.permissions | ForEach-Object { $_.actions } | ForEach-Object { $_ })
+        $roleNotActions = @($role.permissions | ForEach-Object { $_.notActions } | ForEach-Object { $_ })
+        $roleDataActions = @($role.permissions | ForEach-Object { $_.dataActions } | ForEach-Object { $_ })
+        Test-RolePermissionSet -Label 'role actions' -Actual $roleActions -Expected $RequiredActions
+        Test-RolePermissionSet -Label 'not actions' -Actual $roleNotActions -Expected $RequiredNotActions
+        Test-RolePermissionSet -Label 'data actions' -Actual $roleDataActions -Expected $RequiredDataActions
+    }
+
+    Write-Step 'Checking role assignment and ABAC condition'
+    if (-not $entSpObjectId -or -not $roleDefId) {
+        Write-ReadinessResult FAIL 'role assignment' 'cannot check assignment until service principal and role definition exist'
+        Add-Remediation -Requirement "Role assignment: $RoleName at $($script:Scope)" -ServicePrincipal $SpName
+    }
+    else {
+        $assignmentsJson = & az role assignment list --assignee $entSpObjectId --role $RoleName --scope $script:Scope -o json 2>$null
+        $assignment = if ($LASTEXITCODE -eq 0 -and $assignmentsJson) { @($assignmentsJson | ConvertFrom-Json) | Select-Object -First 1 } else { $null }
+        if (-not $assignment) {
+            Write-ReadinessResult FAIL 'role assignment' "missing '$RoleName' assignment for $SpName at $($script:Scope)"
+            Add-Remediation -Requirement "Role assignment: $RoleName at $($script:Scope)" -ServicePrincipal $SpName
+        }
+        else {
+            $missing = @()
+            if ($assignment.scope -ne $script:Scope) { $missing += 'scope' }
+            if ($assignment.principalId -ne $entSpObjectId) { $missing += 'principal' }
+            if ($assignment.roleDefinitionId -ine $roleDefId) { $missing += 'role definition' }
+            if ($missing.Count -eq 0) {
+                Write-ReadinessResult PASS 'role assignment' "assignment is bound to $SpName at $($script:Scope)"
+            }
+            else {
+                Write-ReadinessResult FAIL 'role assignment' "assignment has incorrect $($missing -join ', ')"
+                Add-Remediation -Requirement "Role assignment: $RoleName at $($script:Scope)" -ServicePrincipal $SpName
+            }
+            if ($assignment.conditionVersion -eq '2.0') {
+                Write-ReadinessResult PASS 'ABAC version' 'conditionVersion is 2.0'
+            }
+            else {
+                $version = if ($assignment.conditionVersion) { $assignment.conditionVersion } else { 'missing' }
+                Write-ReadinessResult FAIL 'ABAC version' "conditionVersion is '$version', expected 2.0"
+                Add-Remediation -Requirement "ABAC conditionVersion: 2.0 on $RoleName assignment" -ServicePrincipal $SpName
+            }
+            if ((Normalize-Condition $assignment.condition) -eq (Normalize-Condition (Get-ExpectedAbacCondition))) {
+                Write-ReadinessResult PASS 'ABAC condition' 'role assignment blocks Owner, User Access Administrator, and RBAC Administrator'
+            }
+            else {
+                Write-ReadinessResult FAIL 'ABAC condition' "condition does not match Ent's expected privilege-escalation guard"
+                Add-Remediation -Requirement "ABAC condition: block Owner/User Access Administrator/RBAC Administrator on $RoleName assignment" -ServicePrincipal $SpName
+            }
+        }
+    }
+
+    Test-SubscriptionSecurityPolicies
+
+    Write-Remediation
+
+    Write-Host ''
+    if ($script:ReadinessFails -gt 0) {
+        Write-Host "Readiness check failed: $($script:ReadinessFails) failure(s), $($script:ReadinessWarns) warning(s). Do not start deployment until failures are resolved." -ForegroundColor Red
+        exit 1
+    }
+    if ($script:ReadinessWarns -gt 0) {
+        Write-Host "Readiness check passed with warnings: $($script:ReadinessWarns) warning(s). Review warnings before deployment." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "Readiness check passed: subscription $script:Subscription is ready for Ent deployment." -ForegroundColor Green
+    }
 }
 
 # An explicit -EksOidcIssuer wins; otherwise -Env picks. Mutually exclusive.
@@ -167,6 +658,11 @@ if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
 # Quiet az warnings via env var — recent az rejects --only-show-errors when it
 # precedes the command group.
 $env:AZURE_CORE_ONLY_SHOW_ERRORS = 'true'
+
+if ($CheckReadiness) {
+    Invoke-ReadinessCheck
+    exit 0
+}
 
 # ── Setup walkthrough ─────────────────────────────────────────────────────────
 # Interactive only: piped runs skip prompts (-Subscription required; tenant
@@ -608,10 +1104,7 @@ try {
 
     # ── 6. Role assignment with ABAC privilege-escalation guard ─────────────────
     Write-Step 'Assigning role to the service principal (ABAC-gated)'
-    $abacTemplate = @'
-( ( !(ActionMatches{'Microsoft.Authorization/roleAssignments/write'}) ) OR ( @Request[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {__GUIDS__} ) ) AND ( ( !(ActionMatches{'Microsoft.Authorization/roleAssignments/delete'}) ) OR ( @Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] ForAnyOfAllValues:GuidNotEquals {__GUIDS__} ) )
-'@
-    $abac = $abacTemplate.Replace('__GUIDS__', $ForbiddenRoleGuids)
+    $abac = Get-ExpectedAbacCondition
 
     $existingAssignment = & az role assignment list --assignee $entSpObjectId --role $RoleName --scope $Scope --query "[0].id" -o tsv 2>$null
     if ($existingAssignment) {
