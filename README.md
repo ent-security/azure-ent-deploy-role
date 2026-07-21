@@ -148,6 +148,46 @@ tenant (see [Prerequisites](#prerequisites)).
 No client secret is ever created or stored — Ent authenticates through the
 federated credentials (see [Authentication](#authentication-no-client-secret)).
 
+## Pre-deploy readiness check
+
+After setup has run, you can validate the active Azure subscription without
+changing anything:
+
+```bash
+./setup.sh --check-readiness
+```
+
+```powershell
+./setup.ps1 -CheckReadiness
+```
+
+The check uses the subscription from the current `az` login unless you pass
+`--subscription` / `-Subscription`. It verifies that the Ent deploy app
+registration, service principal, keyless federated credential, custom role
+definition, required role permissions, subscription assignable scope, role
+assignment scope, and ABAC condition are all present and correct.
+If a required role permission is granted through a broader wildcard than the
+initialization script currently writes, the check reports a warning instead of a
+failure.
+When the readiness check finds items to fix, it prints a final remediation
+section that lists each required role entry, ABAC setting, or identity
+requirement next to the service principal it applies to.
+Policy blockers are listed separately under a policy-exception section so they
+can be handled through the customer's policy exception process instead of being
+applied to the service principal.
+
+It also inspects subscription-level controls that can block deployment:
+
+- Azure deny assignments at or above the subscription scope are failures.
+- The targeted Azure Policy `Azure Kubernetes Service Private Clusters should be
+  enabled` is checked by built-in policy ID
+  `040732e8-d947-40b8-95d6-854c95024bf8`, including when it is assigned through
+  an initiative.
+- That policy is a failure only when its active effect is `deny` or
+  `denyAction`, which can surface during deployment as `RequestDisallowedByPolicy`.
+
+The command exits non-zero when any failure is found.
+
 ### Options
 
 | Flag | Description | Default |
@@ -155,6 +195,7 @@ federated credentials (see [Authentication](#authentication-no-client-secret)).
 | `-s`, `--subscription` | Target Azure subscription ID; prompted for interactively when omitted (Enter accepts your active az subscription). Required as a flag for non-interactive runs. | _(prompted)_ |
 | `--role-name` | Custom role display name | `Ent Platform Deploy Role` |
 | `--sp-name` | App registration / service principal display name | `ent-platform-deploy` |
+| `--check-readiness` | Read-only validation of the selected or active subscription; does not register providers, prompt for tenant details, or mutate Azure resources. | `false` |
 | `--env` | Ent home cluster the EKS credential trusts: `prod` or `dev`. `dev` provisions a separate `-dev` identity (see note). | `prod` |
 | `--eks-oidc-issuer` | Explicit EKS OIDC issuer URL (advanced; not combinable with `--env`) | _(resolved from `--env`)_ |
 | `--deploy-sa-subject` | Kubernetes service-account subject for the EKS credential | `system:serviceaccount:ent-home:ent-home-api` |
@@ -166,8 +207,8 @@ can't be derived from Azure and don't change what the script provisions; skipped
 values show `(not provided)` in the final block.
 
 The table shows `setup.sh` flags; `setup.ps1` takes the same options as PowerShell
-parameters — `-Subscription`, `-RoleName`, `-SpName`, `-Env`, `-EksOidcIssuer`,
-`-DeploySaSubject`.
+parameters — `-Subscription`, `-RoleName`, `-SpName`, `-CheckReadiness`,
+`-Env`, `-EksOidcIssuer`, `-DeploySaSubject`.
 
 For customer onboarding, **leave the EKS settings at their defaults** — every
 customer trusts Ent's home-**prod** cluster. `--env dev` exists only for
